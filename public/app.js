@@ -145,8 +145,9 @@ async function loadExhibits() {
         return `<div class="chip ${cls}"><span>${y.year} 年剩余</span>
           <span class="mono">${y.limit === null ? '未设上限' : `${fmtN(y.remaining)} / ${fmtN(y.limit)} lx·h`}</span></div>`;
       }).join('');
+      const unread = e.warningUnreadCount || 0;
       return `<div class="card exhibit-card" data-id="${e.id}">
-        <h3>${esc(e.name)}</h3>
+        <h3>${esc(e.name)}${unread ? ` <span class="tag up" title="未读预警事件">${unread} 条未读预警</span>` : ''}</h3>
         <div class="acc">${esc(e.accession_no || '—')}${e.medium ? ' · ' + esc(e.medium) : ''}</div>
         <div class="year-chips">${chips || '<span class="muted small">尚未登记年度额度</span>'}</div>
       </div>`;
@@ -194,14 +195,20 @@ function renderDetail() {
     `编号：${d.exhibit.accession_no || '—'}　材质：${d.exhibit.medium || '—'}${d.exhibit.note ? '　备注：' + d.exhibit.note : ''}`;
 
   const years = Object.values(d.years);
-  $('#year-tbody').innerHTML = years.length ? years.map((y) => `<tr class="${y.over ? 'over-row' : ''}">
+  const warningYears = (d.warnings && d.warnings.years) || {};
+  $('#year-tbody').innerHTML = years.length ? years.map((y) => {
+    const w = warningYears[String(y.year)] || null;
+    return `<tr class="${y.over ? 'over-row' : ''}">
       <td>${y.year}</td>
       <td class="mono">${y.limit === null ? '未登记' : fmtN(y.limit)}</td>
       <td class="mono">${fmtN(y.used)}</td>
       <td class="mono">${y.remaining === null ? '—' : fmtN(y.remaining)}</td>
       <td>${y.limit === null ? '<span class="muted">无法核算</span>'
         : y.over ? `<b style="color:#b42318">超限 ${fmtN(y.used - y.limit)}</b>` : '正常'}</td>
-    </tr>`).join('') : '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
+      <td>${warningLevelCell(w)}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="6" class="muted">暂无数据</td></tr>';
+  renderWarnings(d);
 
   $('#sources-list').innerHTML = (d.sources || []).map((s) => {
     if (s.kind === 'measurement') {
@@ -744,6 +751,110 @@ function measRow(m) {
     <td>${actions}</td>
   </tr>`;
 }
+
+// ---------- 年度用光分级预警 ----------
+const WARNING_LEVEL_TEXT = { none: '无上限', normal: '正常', low: '低档预警', high: '高档预警' };
+function warningLevelCell(w) {
+  if (!w) return '<span class="muted small">未设阈值</span>';
+  if (w.level === 'none') return '<span class="tag zero">无上限（不触发）</span>';
+  const cls = w.level === 'high' ? 'up' : w.level === 'low' ? 'warn' : 'zero';
+  const ratio = w.ratioPct === null ? '—' : `${fmtN(w.ratioPct)}%`;
+  return `<span class="tag ${cls}">${WARNING_LEVEL_TEXT[w.level] || w.level} ${ratio}</span>
+    <div class="small muted">低 ${fmtN(w.lowPct)}% / 高 ${fmtN(w.highPct)}%${
+      w.unreadEventCount ? ` · <b>${w.unreadEventCount} 条未读</b>` : ''}</div>`;
+}
+
+function renderWarnings(d) {
+  const box = $('#warning-year-list');
+  const evBox = $('#warning-event-list');
+  if (!box || !evBox) return;
+  const wv = d.warnings || { years: {}, events: [] };
+  const years = Object.values(wv.years || {});
+  if (!years.length) {
+    box.innerHTML = '<p class="muted small">尚未设置任何年份的预警阈值。</p>';
+  } else {
+    box.innerHTML = `<table class="data"><thead><tr>
+      <th>年份</th><th>低档阈值</th><th>高档阈值</th><th>当前占用</th><th>占上限</th><th>级别</th><th>基线时间</th>
+      </tr></thead><tbody>${years.map((w) => `<tr class="${w.level === 'high' ? 'over-row' : ''}">
+        <td>${w.year}</td>
+        <td class="mono">${fmtN(w.lowPct)}%</td>
+        <td class="mono">${fmtN(w.highPct)}%</td>
+        <td class="mono">${w.limit === null ? `${fmtN(w.used)}（无上限）` : `${fmtN(w.used)} / ${fmtN(w.limit)} lx·h`}</td>
+        <td class="mono">${w.ratioPct === null ? '—' : fmtN(w.ratioPct) + '%'}</td>
+        <td>${warningLevelCell(w)}</td>
+        <td class="small muted">${w.baselineAt ? new Date(w.baselineAt).toLocaleString('zh-CN') : '—'}</td>
+      </tr>`).join('')}</tbody></table>`;
+  }
+
+  const events = wv.events || [];
+  if (!events.length) {
+    evBox.innerHTML = '<p class="muted small">暂无预警触发事件。</p>';
+  } else {    evBox.innerHTML = `<table class="data"><thead><tr>
+      <th>#</th><th>年份</th><th>级别</th><th>触发时占用</th><th>占上限</th><th>触发来源</th><th>时间</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody>${events.map((ev) => `<tr class="${ev.read ? '' : 'over-row'}">
+        <td>${ev.id}</td>
+        <td>${ev.year}</td>
+        <td><span class="tag ${ev.level === 'high' ? 'up' : 'warn'}">${ev.level === 'high' ? '高档' : '低档'}</span>
+          <div class="small muted">阈值 ${fmtN(ev.thresholdPct)}%</div></td>
+        <td class="mono">${fmtN(ev.used)} / ${fmtN(ev.limit)}</td>
+        <td class="mono">${fmtN(ev.ratioPct)}%</td>
+        <td class="small">${esc(WARNING_TRIGGER_TEXT[ev.triggerType] || ev.triggerType)}${
+          ev.triggerRefId ? ` #${ev.triggerRefId}` : ''}</td>
+        <td class="small">${new Date(ev.createdAt).toLocaleString('zh-CN')}</td>
+        <td>${ev.read ? '<span class="tag zero">已读</span>' : '<b>未读</b>'}</td>
+        <td>${ev.read ? '—' : '<button class="small-btn warning-read-btn conservator-only" data-id="' + ev.id + '">标记已读</button>'}</td>
+      </tr>`).join('')}</tbody></table>`;
+    $$('.warning-read-btn').forEach((btn) => btn.addEventListener('click', async () => {
+      try {
+        await api('POST', `/api/warning-events/${btn.dataset.id}/read`);
+        await openDetail(state.detail.exhibit.id);
+        flash('success', '预警事件已标记已读（预警级别不变）');
+      } catch (err) { flash('error', err.message); }
+    }));
+  }
+}
+
+const WARNING_TRIGGER_TEXT = {
+  'plan.approve': '计划审批',
+  'plan.batch_approve': '联合核准',
+  'plan.cancel': '计划取消',
+  'plan.adjust': '计划调整',
+  'limit.change': '上限变更',
+  'measurement.confirm': '实测确认',
+  'measurement.correct': '实测纠错',
+  'measurement_batch.confirm': '实测批次确认',
+  'blackout.create': '停灯登记',
+  'incident.create': '照明事故',
+  'shared_lighting.create': '共享照明入账',
+};
+
+$('#warning-threshold-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  const year = Number(fd.get('year'));
+  const lowPct = Number(fd.get('lowPct'));
+  const highPct = Number(fd.get('highPct'));
+  try {
+    const r = await api('PUT', `/api/exhibits/${state.detail.exhibit.id}/warning-threshold`, {
+      year, lowPct, highPct,
+    });
+    state.detail = { ...state.detail, warnings: r.warnings };
+    // 阈值/基线不影响既有 years 数值，但占比展示随上限可能变化，整体刷新
+    await openDetail(state.detail.exhibit.id);
+    flash('success',
+      `${year} 年预警阈值已保存（低 ${lowPct}% / 高 ${highPct}%），已按当前占用重建基线，不补发事件`);
+  } catch (err) { flash('error', err.message); }
+});
+
+$('#warning-read-all-btn')?.addEventListener('click', async () => {
+  if (!state.detail) return;
+  try {
+    const r = await api('POST', '/api/warning-events/read', { exhibitId: state.detail.exhibit.id });
+    await openDetail(state.detail.exhibit.id);
+    flash('success', `已把 ${r.updated} 条未读预警事件标记为已读`);
+  } catch (err) { flash('error', err.message); }
+});
 
 $('#limit-form').addEventListener('submit', async (e) => {
   e.preventDefault();

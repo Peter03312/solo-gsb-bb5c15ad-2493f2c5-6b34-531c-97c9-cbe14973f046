@@ -26,6 +26,7 @@ const {
   computeOccupancy,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -198,6 +199,12 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       }
 
       const { exhibitDetail } = require('./exhibits');
+      // 事故实际用光已入账：在展品锁事务内重算分级预警（向上跨档才留事件）
+      await recomputeWarnings(client, input.exhibitId, {
+        occupancy,
+        triggerType: 'incident.create',
+        triggerRefId: incidentId,
+      });
       const detailAfter = await exhibitDetail(client, input.exhibitId, { lock: true });
       const freshView = await loadIncidentView(client, input.exhibitId);
       const incidentItem = freshView.items.find((x) => x.id === incidentId) || null;

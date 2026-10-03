@@ -17,6 +17,7 @@ const {
   registerBlackout,
 } = require('../service');
 const { wallToTs, tsToWallString, yearMapToObject, doseByYear } = require('../dosing');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -160,6 +161,11 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       });
 
       const { exhibitDetail } = require('./exhibits');
+      // 停灯从估算残余扣减：占用下降（回落不写事件），仍在展品锁事务内重算级别状态
+      await recomputeWarnings(client, plan.exhibit_id, {
+        triggerType: 'blackout.create',
+        triggerRefId: row.id,
+      });
       const detailAfter = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       // 取登记人名（拆简单查询，规避内存驱动 JOIN 缺陷）
       const created = (await client.query('SELECT * FROM blackouts WHERE id = $1', [row.id])).rows[0];

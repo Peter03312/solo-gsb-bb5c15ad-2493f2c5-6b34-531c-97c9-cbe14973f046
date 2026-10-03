@@ -18,6 +18,7 @@ const {
   dateYmd,
 } = require('../service');
 const { exhibitDetail } = require('./exhibits');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -583,6 +584,10 @@ router.post('/pair/approve', requireRole('conservator'), async (req, res, next) 
         });
       }
 
+      await recomputeWarnings(client, exhibitId, {
+        triggerType: 'plan.adjust',
+        triggerRefId: planA.id,
+      });
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {
         ...detailAfter,
@@ -693,6 +698,10 @@ router.post('/:id/approve', requireRole('conservator'), async (req, res, next) =
         newResidueYearly: evalResult.newResidueYearly,
       });
 
+      await recomputeWarnings(client, plan.exhibit_id, {
+        triggerType: 'plan.adjust',
+        triggerRefId: plan.id,
+      });
       return exhibitDetail(client, plan.exhibit_id, { lock: true });
     });
 

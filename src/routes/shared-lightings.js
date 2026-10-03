@@ -34,6 +34,7 @@ const {
   computeOccupancy,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -199,11 +200,13 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
           });
 
         // 逐展品重算占用并收集超额（本次归属剂量影响到的年份为限）；超限仍入账。
+        const occupancyByExhibit = new Map();
         const overflowsByExhibit = [];
         const flaggedPlansByExhibit = [];
         const exhibitDetails = [];
         for (const exId of exhibitIds) {
           const occupancy = await computeOccupancy(client, exId);
+          occupancyByExhibit.set(exId, occupancy);
           const allocsHere = allocations.filter((a) => a.exhibitId === exId);
           const candidateYears = new Set();
           for (const a of allocsHere) for (const y of Object.keys(a.yearly)) candidateYears.add(Number(y));
@@ -251,8 +254,16 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
           }
         }
 
-        // 刷新各展品详情（含被转待复核后的状态）
+        // 刷新各展品详情（含被转待复核后的状态）前，逐展品在同一事务内重算分级预警；
+        // 多展品操作回滚时预警事件也一并回滚。
         const { exhibitDetail } = require('./exhibits');
+        for (const exId of exhibitIds) {
+          await recomputeWarnings(client, exId, {
+            occupancy: occupancyByExhibit.get(exId),
+            triggerType: 'shared_lighting.create',
+            triggerRefId: sessionId,
+          });
+        }
         for (const exId of exhibitIds) {
           exhibitDetails.push(await exhibitDetail(client, exId, { lock: true }));
         }

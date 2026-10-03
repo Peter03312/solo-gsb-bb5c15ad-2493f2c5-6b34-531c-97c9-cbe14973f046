@@ -80,6 +80,9 @@ label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color:
 .chip.over { background: #fdeceb; color: #b42318; font-weight: 600; }
 .chip.warn { background: #fff5e0; color: #9a6700; }
 
+/* 分级预警 */
+.tag.warn { background: #fff5e0; color: #9a6700; }
+
 table.data { width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; }
 table.data th, table.data td { border: 1px solid #e4e7eb; padding: 7px 9px; text-align: left; vertical-align: top; }
 table.data th { background: #f0f3f6; font-weight: 600; }

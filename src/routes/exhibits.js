@@ -15,6 +15,7 @@ const {
   serializeLedger,
   buildYearSnapshot,
 } = require('../ledger');
+const { loadWarningView, recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -125,6 +126,9 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     (b) => serializeMeasurementBatch(b, { withRows: false })
   );
 
+  // 年度用光分级预警（规则 21，仅附加字段）：各年阈值/当前占用/级别 + 最近触发事件
+  const warnings = await loadWarningView(client, exhibitId);
+
   return {
     exhibit,
     years: occupancy.years,
@@ -140,6 +144,7 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     sharedLightingDoseYearly,
     ledgers,
     measurementBatches,
+    warnings,
   };
 }
 
@@ -239,7 +244,20 @@ router.get('/', async (req, res, next) => {
     const items = [];
     for (const e of rows) {
       const occupancy = await computeOccupancy({ query }, e.id);
-      items.push({ ...e, years: occupancy.years });
+      const unreadResult = await query(
+        `SELECT year, COUNT(*)::int AS n FROM annual_warning_events
+          WHERE exhibit_id = $1 AND read_at IS NULL GROUP BY year`,
+        [e.id]
+      );
+      const unreadRows = Array.isArray(unreadResult) ? unreadResult : unreadResult.rows;
+      const warningUnreadByYear = {};
+      for (const u of unreadRows) warningUnreadByYear[String(u.year)] = Number(u.n);
+      items.push({
+        ...e,
+        years: occupancy.years,
+        warningUnreadCount: unreadRows.reduce((s, u) => s + Number(u.n), 0),
+        warningUnreadByYear,
+      });
     }
     res.json({ exhibits: items });
   } catch (err) {
@@ -383,6 +401,8 @@ router.post('/:id/limits/lower', requireRole('conservator'), async (req, res, ne
         client, req.sessionUser, exhibitId, year, previousLimit, preview,
         { auditAction: 'limit.lower' }
       );
+      // 上限变更：在展品锁事务内按最新上限重算分级预警（向上跨档才留事件）
+      await recomputeWarnings(client, exhibitId, { triggerType: 'limit.change' });
 
       // 成功响应与既有额度修改接口兼容：展品详情字段位于顶层
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
@@ -443,6 +463,8 @@ router.post('/:id/limits', requireRole('conservator'), async (req, res, next) =>
           lowered: false,
         });
       }
+      // 上限登记/修改（含下调）后在同一展品锁事务内重算分级预警
+      await recomputeWarnings(client, exhibitId, { triggerType: 'limit.change' });
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {
         ...detailAfter,

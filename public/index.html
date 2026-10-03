@@ -59,9 +59,28 @@
 
           <h4>各自然年额度（lx·h）</h4>
           <table class="data">
-            <thead><tr><th>年份</th><th>年度上限</th><th>已占用</th><th>剩余额度</th><th>状态</th></tr></thead>
+            <thead><tr><th>年份</th><th>年度上限</th><th>已占用</th><th>剩余额度</th><th>状态</th><th>分级预警</th></tr></thead>
             <tbody id="year-tbody"></tbody>
           </table>
+
+          <h4>年度用光分级预警（低 / 高两档，占年度上限百分比）</h4>
+          <p class="muted small">保管员按展品和自然年设置低、高两档阈值（0 &lt; 低 &lt; 高 ≤ 100）。
+            首次设置或修改阈值以<b>当时占用重建基线，不补发事件</b>；此后占用<b>向上跨过</b>每档各留一条事件，
+            回落后再次跨越可重触发；跨年独立判定。未登记年度上限时显示「无上限」且不触发；超上限仍显示真实占用与最高级别。
+            登录用户可查看当前占用、级别与触发历史；保管员可把事件标记已读（不改变级别）。</p>
+          <form id="warning-threshold-form" class="inline-form conservator-only">
+            <span>设置预警阈值：</span>
+            <input name="year" type="number" min="1900" max="2999" placeholder="年份，如 2026" required />
+            <input name="lowPct" type="number" step="0.1" min="0.1" max="100" placeholder="低档 %（如 70）" required />
+            <input name="highPct" type="number" step="0.1" min="0.1" max="100" placeholder="高档 %（如 90）" required />
+            <button class="primary">保存阈值（重建基线）</button>
+          </form>
+          <div id="warning-year-list"></div>
+          <div class="panel-head">
+            <h4 style="margin-bottom:0">预警触发历史</h4>
+            <button type="button" id="warning-read-all-btn" class="small-btn conservator-only">本展品全部标记已读</button>
+          </div>
+          <div id="warning-event-list"></div>
 
           <form id="limit-form" class="inline-form conservator-only">
             <span>登记/修改年度上限：</span>

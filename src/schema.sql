@@ -267,6 +267,68 @@ CREATE TABLE IF NOT EXISTS annual_ledgers (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_exhibit ON annual_ledgers (exhibit_id, year);
 
+-- 展品年度用光分级预警（规则 21）：保管员按“展品 + 自然年”设置低、高两档阈值，
+-- 阈值为“年度上限占比”（百分数，0 < 低 < 高 <= 100）；未登记年度上限的年份显示“无上限”、不触发。
+-- 首次设置或修改阈值时以当时占用重建基线（annual_warning_states），不补发事件。
+CREATE TABLE IF NOT EXISTS annual_warning_thresholds (
+    id              BIGSERIAL PRIMARY KEY,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year            INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    low_pct         NUMERIC(5,2) NOT NULL CHECK (low_pct > 0 AND low_pct <= 100),
+    high_pct        NUMERIC(5,2) NOT NULL CHECK (high_pct > 0 AND high_pct <= 100),
+    created_by      BIGINT REFERENCES users(id),
+    updated_by      BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, year),
+    CHECK (low_pct < high_pct)
+);
+CREATE INDEX IF NOT EXISTS idx_warning_threshold_exhibit ON annual_warning_thresholds (exhibit_id, year);
+
+-- 各展品各自然年的预警状态（基线）：
+--   * 阈值首次设置/修改时 upsert 为当时的级别（level）、占用与占比，不补发事件；
+--   * 此后任何在展品锁事务内改变占用/上限的操作重算：占用“向上跨过”某档才各写一条
+--     annual_warning_events；回落后再次向上跨越可重触发；级别本身始终反映当前占用；
+--   * 跨年独立：状态按 (exhibit_id, year) 一行，互不影响；
+--   * 未登记年度上限时 level='none'（页面显示“无上限”），不产生事件。
+-- level: none 无预警（无阈值或无上限）/ normal 未达低档 / low 已达低档未达高档 / high 已达高档（含超上限）
+CREATE TABLE IF NOT EXISTS annual_warning_states (
+    id                BIGSERIAL PRIMARY KEY,
+    exhibit_id        BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year              INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    level             TEXT NOT NULL DEFAULT 'none'
+                      CHECK (level IN ('none','normal','low','high')),
+    used_lxh          NUMERIC(12,3),
+    limit_lxh         NUMERIC(12,3),
+    ratio_pct         NUMERIC(7,3),
+    baseline          BOOLEAN NOT NULL DEFAULT FALSE,
+    baseline_at       TIMESTAMPTZ,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, year)
+);
+CREATE INDEX IF NOT EXISTS idx_warning_state_exhibit ON annual_warning_states (exhibit_id, year);
+
+-- 预警触发历史（只在占用向上跨过阈值档时写入；回落不写、修改阈值重建基线不补发）。
+-- 每条记录不可修改；保管员可标记 read_at（已读不改变预警级别）。
+CREATE TABLE IF NOT EXISTS annual_warning_events (
+    id              BIGSERIAL PRIMARY KEY,
+    exhibit_id      BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year            INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    level           TEXT NOT NULL CHECK (level IN ('low','high')),
+    threshold_pct   NUMERIC(5,2) NOT NULL,
+    used_lxh        NUMERIC(12,3) NOT NULL,
+    limit_lxh       NUMERIC(12,3) NOT NULL,
+    ratio_pct       NUMERIC(7,3) NOT NULL,
+    trigger_type    TEXT NOT NULL,
+    trigger_ref_id  BIGINT,
+    previous_level  TEXT,
+    read_at         TIMESTAMPTZ,
+    read_by         BIGINT REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_warning_event_exhibit ON annual_warning_events (exhibit_id, year, id DESC);
+CREATE INDEX IF NOT EXISTS idx_warning_event_unread ON annual_warning_events (read_at, id DESC);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,

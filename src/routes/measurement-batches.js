@@ -27,6 +27,7 @@ const {
 } = require('../service');
 const { round3 } = require('../dosing');
 const { parseMeasurementCsvRows } = require('../csv');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -464,6 +465,13 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
           reason: () => `实测批次 #${id} 确认后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
         });
       }
+
+      // 批次确认：新实测已按统一口径入账，重算分级预警（整批随事务原子生效/回滚）
+      await recomputeWarnings(client, exhibitId, {
+        occupancy,
+        triggerType: 'measurement_batch.confirm',
+        triggerRefId: id,
+      });
 
       const confirmResult = {
         rowCount: evaluated.length,

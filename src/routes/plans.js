@@ -33,6 +33,7 @@ const {
 } = require('../dosing');
 const { ConflictError, AuthError } = require('../validation');
 const { exhibitDetail } = require('./exhibits');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -315,12 +316,14 @@ router.post('/batch/approve', requireRole('conservator'), async (req, res, next)
 
       // 成功响应：单展品时与既有单条批准同构（展品详情顶层字段保持兼容）
       if (exhibitIds.length === 1) {
+        await recomputeWarnings(client, exhibitIds[0], { triggerType: 'plan.batch_approve' });
         const detailAfter = await exhibitDetail(client, exhibitIds[0], { lock: true });
         return { ...detailAfter, batchApproval };
       }
       // 跨展品：返回各展品最新详情（既有单展品字段不适用，不新增顶层展品详情字段）
       const details = [];
       for (const exId of exhibitIds) {
+        await recomputeWarnings(client, exId, { triggerType: 'plan.batch_approve' });
         details.push(await exhibitDetail(client, exId, { lock: true }));
       }
       return { ok: true, batchApproval, exhibitDetails: details };
@@ -426,6 +429,9 @@ async function approve(req, res) {
     await recordAudit(client, req.sessionUser, prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
       'plan', id, { exhibitId: plan.exhibit_id, addedYearly });
 
+    // 占用已变（计划入账）：在展品锁事务内重算分级预警（向上跨档才留事件）
+    await recomputeWarnings(client, plan.exhibit_id, { triggerType: 'plan.approve', triggerRefId: id });
+
     return exhibitDetail(client, plan.exhibit_id, { lock: true });
   });
   res.json(detail);
@@ -491,6 +497,11 @@ router.post('/:id/cancel', async (req, res, next) => {
         reason,
         previousStatus: plan.status,
       });
+      // 已批准/待复核计划取消会释放估算占用：回落不写事件，但仍重算级别状态
+      if (['approved', 'pending_review'].includes(plan.status)) {
+        await recomputeWarnings(client, plan.exhibit_id,
+          { triggerType: 'plan.cancel', triggerRefId: id });
+      }
     });
     res.json({ ok: true });
   } catch (err) {

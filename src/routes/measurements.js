@@ -23,6 +23,7 @@ const {
 } = require('../service');
 const { doseByYear, yearMapToObject, tsToWallString } = require('../dosing');
 const { exhibitDetail, serializeMeasurement } = require('./exhibits');
+const { recomputeWarnings } = require('../warnings');
 
 const router = express.Router();
 
@@ -227,6 +228,13 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         });
       }
 
+      // 实测确认：占用按统一口径变化（实测替代估算），重算分级预警
+      await recomputeWarnings(client, plan.exhibit_id, {
+        occupancy: await computeOccupancy(client, plan.exhibit_id),
+        triggerType: 'measurement.confirm',
+        triggerRefId: id,
+      });
+
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       return { detail, overflows, overflowYears, flagged };
     });
@@ -333,6 +341,13 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
             `实测 #${id} 纠错为 #${replacement.id} 后导致 ${overflowYears.join('、')} 年额度超限，转待复核`,
         });
       }
+
+      // 实测纠错：按纠错后占用重算分级预警（向上跨档才留事件）
+      await recomputeWarnings(client, plan.exhibit_id, {
+        occupancy,
+        triggerType: 'measurement.correct',
+        triggerRefId: replacement.id,
+      });
 
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       const correction = {

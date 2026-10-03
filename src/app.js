@@ -19,6 +19,7 @@ const incidentRoutes = require('./routes/incidents');
 const residenceRoutes = require('./routes/residences');
 const sharedLightingRoutes = require('./routes/shared-lightings');
 const ledgerRoutes = require('./routes/ledgers');
+const warningRoutes = require('./routes/warnings');
 const auditRoutes = require('./routes/audit');
 
 function createApp() {
@@ -41,6 +42,8 @@ function createApp() {
   app.use('/api/halls', residenceRoutes.hallRouter);
   app.use('/api/residences', residenceRoutes.router);
   app.use('/api/shared-lightings', sharedLightingRoutes.router);
+  app.use('/api/shared-lightings', sharedLightingRoutes.router);
+  app.use('/api', warningRoutes);
   app.use('/api/exhibits/:id/ledgers', ledgerRoutes);
   app.use('/api/audit', auditRoutes);
 

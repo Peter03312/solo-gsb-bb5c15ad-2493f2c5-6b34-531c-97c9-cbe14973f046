@@ -3075,6 +3075,231 @@ async function runFlow() {
     assert(newItem && newItem.sourceKey.startsWith('sharedLighting:') && newItem.currentDose === 300,
       '账册对照列出封存后新增共享照明来源');
   }
+
+  // ==========================================================================
+  // 规则 21：展品年度用光分级预警（低/高两档阈值、向上跨档事件、回落重触发、
+  //          跨年独立、无上限不触发、阈值修改重建基线不补发、已读不改级别、
+  //          上限变更/审批/取消/实测确认触发、多展品原子回滚、登录可读/布展员不可写）
+  // ==========================================================================
+  {
+    const exW = await createExhibit('分级预警展品');
+    const wy = 2061; // 未来年：计划未开始，便于审批入账
+    // 未设置阈值时：详情 warnings 为空结构、年度列“未设阈值”
+    r = await call('GET', `/api/exhibits/${exW}`, null, 'i');
+    assert(r.status === 200 && r.body.warnings && r.body.warnings.configuredCount === 0,
+      '未配置阈值时展品详情附空 warnings 视图');
+
+    // 阈值校验：非数字 / 越界 / 低>=高 全部 400
+    r = await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 0, highPct: 90 }, 'c');
+    assert(r.status === 400, '低档阈值必须 > 0');
+    r = await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 90, highPct: 101 }, 'c');
+    assert(r.status === 400, '高档阈值必须 <= 100');
+    r = await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 90, highPct: 80 }, 'c');
+    assert(r.status === 400, '低档必须小于高档');
+    r = await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 70, highPct: 90 }, 'i');
+    assert(r.status === 403, '布展员不能设置预警阈值');
+
+    // 先在“无上限”年份设置阈值：显示无上限、不触发
+    r = await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 70, highPct: 90 }, 'c');
+    assert(r.status === 200 && r.body.baselineLevel === 'none',
+      '无上限年份设置阈值：基线级别 none（无上限），不补发事件');
+    r = await call('GET', `/api/exhibits/${exW}/warnings`, null, 'i');
+    assert(r.body.warnings.years[String(wy)].level === 'none' &&
+           r.body.warnings.years[String(wy)].label === '无上限',
+      '登录用户查看预警视图：无上限级别与“无上限”标签');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW, null, 'i');
+    assert(r.body.events.length === 0, '无上限不产生事件');
+
+    // 登记上限 1000 后：上限变更属重算场景；但此前基线为 none（无上限），不补发事件，
+    // 状态变为 normal（占用 0，占比 0%）
+    await call('POST', `/api/exhibits/${exW}/limits`, { year: wy, limitLxh: 1000 }, 'c');
+    r = await call('GET', `/api/exhibits/${exW}/warnings`, null, 'c');
+    assert(r.body.warnings.years[String(wy)].level === 'normal' &&
+           r.body.warnings.years[String(wy)].ratioPct === 0,
+      '登记上限后级别为 normal（none 基线不补发事件）');
+
+    // 提交并批准计划：2061-05-01 单日 10:00-14:00（4h），200lx = 800（80%）→ 跨低档
+    const pW1 = await submitPlan(exW, '预警计划八成', `${wy}-05-01`, `${wy}-05-01`,
+      ['10:00-14:00'], 200);
+    r = await call('POST', `/api/plans/${pW1}/approve`, {}, 'c');
+    assert(r.status === 200, '批准八成占用计划成功');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW, null, 'i');
+    assert(r.body.events.length === 1 && r.body.events[0].level === 'low' &&
+           r.body.events[0].triggerType === 'plan.approve' &&
+           r.body.events[0].triggerRefId === pW1 &&
+           r.body.events[0].previousLevel === 'normal' &&
+           r.body.events[0].used === 800 && r.body.events[0].ratioPct === 80,
+      '审批使占用向上跨过低档：1 条 low 事件（含触发来源、前后级别、占用、占比）');
+
+    // 此时真实占用与级别如实显示
+    r = await call('GET', `/api/exhibits/${exW}`, null, 'i');
+    assert(r.body.years[String(wy)].used === 800 &&
+           r.body.warnings.years[String(wy)].level === 'low',
+      '当前占用 800（80%），级别 low');
+
+    // 取消计划：占用回落到 0，不写事件；级别回到 normal
+    r = await call('POST', `/api/plans/${pW1}/cancel`, {}, 'c');
+    assert(r.status === 200, '取消已批准计划');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW, null, 'i');
+    assert(r.body.events.length === 1, '回落不写事件（仍只有 1 条）');
+    r = await call('GET', `/api/exhibits/${exW}/warnings`, null, 'i');
+    assert(r.body.warnings.years[String(wy)].level === 'normal',
+      '回落后级别回到 normal');
+
+    // 重新提交/批准同档期计划：再次向上跨低档，可重触发
+    const pW1b = await submitPlan(exW, '预警计划八成-重批', `${wy}-05-01`, `${wy}-05-01`,
+      ['10:00-14:00'], 200);
+    await call('POST', `/api/plans/${pW1b}/approve`, {}, 'c');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW, null, 'i');
+    assert(r.body.events.length === 2 && r.body.events[0].level === 'low',
+      '回落后再次向上跨越低档：重触发，第 2 条 low 事件');
+
+    // 阈值修改：以当时占用（800/1000=80%）重建基线，不补发事件
+    r = await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 50, highPct: 80 }, 'c');
+    assert(r.status === 200 && r.body.baselineLevel === 'high',
+      '修改阈值（50/80）后当前 80% 恰在高档：基线重建为 high');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW, null, 'i');
+    assert(r.body.events.length === 2, '修改阈值重建基线不补发事件');
+
+    // 把阈值调回 70/90 但当前 80% → 基线 low（仍不补发）
+    await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy, lowPct: 70, highPct: 90 }, 'c');
+
+    // 再批准一条不与第一条重叠的计划：2061-06-01 10:00-12:00（2h），100lx = 200
+    // 合计 1000（100%）→ 向上跨高档（high）
+    const pW2 = await submitPlan(exW, '预警计划到满', `${wy}-06-01`, `${wy}-06-01`,
+      ['10:00-12:00'], 100);
+    r = await call('POST', `/api/plans/${pW2}/approve`, {}, 'c');
+    assert(r.status === 200, '批准补足计划成功');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW + '&level=high', null, 'i');
+    assert(r.body.events.length === 1 && r.body.events[0].level === 'high' &&
+           r.body.events[0].previousLevel === 'low' &&
+           r.body.events[0].used === 1000 && r.body.events[0].ratioPct === 100,
+      '占用向上跨高档：1 条 high 事件（previousLevel=low，占比 100%）');
+
+    // 超上限仍显示真实占用与最高级别：登记计划外事故（未来年不允许“已发生”，故用上一年不行；
+    // 改用确认实测替代估算不能超 100%，事故/共享照明要求已结束。这里以“下调上限”使占用超 100%）
+    r = await call('POST', `/api/exhibits/${exW}/limits`, { year: wy, limitLxh: 900 }, 'c');
+    assert(r.status === 200, '下调上限至 900（占用 1000，超 100%）');
+    r = await call('GET', `/api/exhibits/${exW}`, null, 'i');
+    assert(r.body.years[String(wy)].used === 1000 && r.body.years[String(wy)].over === true &&
+           r.body.warnings.years[String(wy)].level === 'high' &&
+           r.body.warnings.years[String(wy)].ratioPct > 100,
+      '超上限仍显示真实占用 1000 与最高级别 high（占比 >100%）');
+    // 上限从 1000 下调到 900：级别在 high 内（已是 high），同档不重复留事件
+    const evCountAfterLower = (await call('GET',
+      '/api/warning-events?exhibitId=' + exW, null, 'i')).body.events.length;
+    assert(evCountAfterLower === 3,
+      `高档内下调上限不重复留事件（3 条：2 low + 1 high），实际 ${evCountAfterLower}`);
+
+    // 标记已读：布展员 403；保管员可标记，且不改变级别
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW + '&unread=1', null, 'i');
+    const unreadEvents = r.body.events;
+    assert(unreadEvents.length === 3, '3 条未读事件');
+    r = await call('POST', `/api/warning-events/${unreadEvents[0].id}/read`, {}, 'i');
+    assert(r.status === 403, '布展员不能标记已读');
+    r = await call('POST', `/api/warning-events/${unreadEvents[0].id}/read`, {}, 'c');
+    assert(r.status === 200 && r.body.event.read === true, '保管员标记单条已读');
+    r = await call('POST', `/api/warning-events/${unreadEvents[0].id}/read`, {}, 'c');
+    assert(r.status === 200, '重复标记已读幂等');
+    r = await call('GET', `/api/exhibits/${exW}/warnings`, null, 'i');
+    assert(r.body.warnings.years[String(wy)].level === 'high',
+      '标记已读不改变预警级别（仍 high）');
+    r = await call('POST', '/api/warning-events/read', { exhibitId: exW }, 'c');
+    assert(r.status === 200 && r.body.updated === 2, '批量标记剩余 2 条已读');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW + '&unread=1', null, 'i');
+    assert(r.body.events.length === 0 && r.body.unreadCount === 0,
+      '全部已读后未读列表为空、unreadCount=0');
+    r = await call('POST', '/api/warning-events/999999/read', {}, 'c');
+    assert(r.status === 400, '标记不存在事件 → 400');
+
+    // 跨年独立：另一年阈值与事件互不影响
+    const wy2 = wy + 1;
+    await call('POST', `/api/exhibits/${exW}/limits`, { year: wy2, limitLxh: 1000 }, 'c');
+    await call('PUT', `/api/exhibits/${exW}/warning-threshold`,
+      { year: wy2, lowPct: 70, highPct: 90 }, 'c');
+    const pW3 = await submitPlan(exW, '次年八成计划', `${wy2}-05-01`, `${wy2}-05-01`,
+      ['10:00-14:00'], 200);
+    await call('POST', `/api/plans/${pW3}/approve`, {}, 'c');
+    r = await call('GET', `/api/warning-events?exhibitId=${exW}&year=${wy2}`, null, 'i');
+    assert(r.body.events.length === 1 && r.body.events[0].year === wy2,
+      '跨年独立：次年只产生次年自己的 1 条 low 事件');
+    r = await call('GET', `/api/warning-events?exhibitId=${exW}&year=${wy}`, null, 'i');
+    assert(r.body.events.length === 3, '原 wy 年仍为 3 条事件');
+
+    // 多展品操作回滚 → 事件一并回滚：构造一个会在提交时因超额失败的联合核准。
+    // 展品 exW2：上限 100，两计划合计将超额；组内不重叠（不同日期）。
+    const exW2 = await createExhibit('预警整组回滚展品');
+    const wy3 = 2063;
+    await call('POST', `/api/exhibits/${exW2}/limits`, { year: wy3, limitLxh: 100 }, 'c');
+    await call('PUT', `/api/exhibits/${exW2}/warning-threshold`,
+      { year: wy3, lowPct: 50, highPct: 90 }, 'c'); // 占用 0 基线 normal
+    const bp1 = await submitPlan(exW2, '整组计划1', `${wy3}-05-01`, `${wy3}-05-01`,
+      ['10:00-12:00'], 100); // 200
+    const bp2 = await submitPlan(exW2, '整组计划2', `${wy3}-05-02`, `${wy3}-05-02`,
+      ['10:00-12:00'], 100); // 200
+    r = await call('POST', '/api/plans/batch/approve', { planIds: [bp1, bp2] }, 'c');
+    assert(r.status === 409, '联合核准因超额失败（整组回滚）');
+    r = await call('GET', '/api/warning-events?exhibitId=' + exW2, null, 'i');
+    assert(r.body.events.length === 0,
+      '整组回滚后预警事件也一并回滚（无任何事件）');
+    // 计划仍为待批准
+    r = await call('GET', `/api/plans/${bp1}`, null, 'i');
+    assert(r.body.plan.status === 'submitted', '回滚后计划仍待批准');
+
+    // 触发来源覆盖：实测确认使占用跨档（阈值先设为很容易跨的低档 10%）
+    const exW3 = await createExhibit('预警实测触发展品');
+    const wy4 = 2064;
+    await call('POST', `/api/exhibits/${exW3}/limits`, { year: wy4, limitLxh: 1000 }, 'c');
+    await call('PUT', `/api/exhibits/${exW3}/warning-threshold`,
+      { year: wy4, lowPct: 10, highPct: 90 }, 'c');
+    const pM = await submitPlan(exW3, '预警实测计划', `${wy4}-05-01`, `${wy4}-05-01`,
+      ['09:00-17:00'], 100);
+    await approvePlan(pM); // 估算 800（80%）→ 已跨低档（事件 1：plan.approve）
+    // 录入并确认一段实测 2h @100 = 200，落在计划窗内：实测替代估算，占用基本不变；
+    // 改为录入高照度实测使占用净增加：10:00-12:00（2h）@300 = 600，替代该 2h 估算 200，净 +400 → 1200（120%）
+    r = await call('POST', '/api/measurements', {
+      planId: pM,
+      startDate: `${wy4}-05-01`, startTime: '10:00',
+      endDate: `${wy4}-05-01`, endTime: '12:00',
+      actualLux: 300,
+    }, 'c');
+    assert(r.status === 201, '录入待确认实测');
+    const measId = r.body.measurement.id;
+    r = await call('POST', `/api/measurements/${measId}/confirm`, {}, 'c');
+    // 超限仍生效 → 409；高档事件应已随事务写入
+    assert(r.status === 409, '实测确认后超限（仍生效，409）');
+    r = await call('GET', `/api/warning-events?exhibitId=${exW3}`, null, 'i');
+    const triggers = r.body.events.map((e) => e.triggerType).sort();
+    assert(triggers.includes('measurement.confirm'),
+      '实测确认触发预警事件（triggerType=measurement.confirm）：' + JSON.stringify(triggers));
+    assert(r.body.events.some((e) => e.level === 'high'),
+      '实测确认使占用跨过高档：存在 high 事件');
+    // 超限后真实占用与最高级别如实显示
+    r = await call('GET', `/api/exhibits/${exW3}`, null, 'i');
+    assert(r.body.years[String(wy4)].over === true &&
+           r.body.warnings.years[String(wy4)].level === 'high' &&
+           r.body.years[String(wy4)].used === 1200,
+      '实测超限后真实占用 1200、级别 high');
+
+    // 未登录不可查看
+    r = await call('GET', '/api/warning-events', null, null);
+    assert(r.status === 401, '未登录不能查看预警历史');
+
+    // 阈值设置写入操作流水
+    r = await call('GET', '/api/audit?targetType=exhibit&limit=500', null, 'c');
+    assert(r.body.events.some((ev) => ev.action === 'warning_threshold.set' &&
+      Number(ev.target_id) === Number(exW)),
+      '操作流水含 warning_threshold.set 审计');
+
+    console.log('  ✓ 分级预警（规则 21）流程通过');
+  }
 }
 
 main().catch((err) => {

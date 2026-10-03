@@ -5,6 +5,7 @@
 const assert = require('assert');
 const dosing = require('../src/dosing');
 const { parsePeriods, ValidationError } = require('../src/validation');
+const { levelForUsed } = require('../src/warnings');
 
 let passed = 0;
 function test(name, fn) {
@@ -149,6 +150,16 @@ test('事故完全在开灯窗外：窗内为 0，计划残余不被扣减，事
     .reduce((s, p) => s + (p.end - p.start) / 60000, 0);
   assert.strictEqual(residueMin, 480);
   assert.strictEqual(dosing.doseByYear([incident], 50).get(2026), 100);
+});
+
+// 8) 分级预警级别判定（占年度上限百分比）
+test('预警级别：无上限 / 未达低档 / 恰达低档 / 恰达高档 / 超 100%', () => {
+  assert.strictEqual(levelForUsed(0, null, 70, 90), 'none');
+  assert.strictEqual(levelForUsed(699.999, 1000, 70, 90), 'normal');
+  assert.strictEqual(levelForUsed(700, 1000, 70, 90), 'low');   // 恰 70%（含端点）
+  assert.strictEqual(levelForUsed(899.999, 1000, 70, 90), 'low');
+  assert.strictEqual(levelForUsed(900, 1000, 70, 90), 'high');  // 恰 90%
+  assert.strictEqual(levelForUsed(1200, 1000, 70, 90), 'high'); // 超上限仍最高级
 });
 
 console.log(`\n全部 ${passed} 项算法测试通过。`);
