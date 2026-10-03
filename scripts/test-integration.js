@@ -3075,6 +3075,250 @@ async function runFlow() {
     assert(newItem && newItem.sourceKey.startsWith('sharedLighting:') && newItem.currentDose === 300,
       '账册对照列出封存后新增共享照明来源');
   }
+
+  // =======================================================================
+  // 年度用光分级预警（阈值基线 / 边沿触发 / 回落重触发 / 无上限 / 跨年 / 回滚 / 已读）
+  // =======================================================================
+  {
+    const wallYear = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
+    const y = wallYear;
+    const exQ = await createExhibit('分级预警展品');
+    await call('POST', `/api/exhibits/${exQ}/limits`, { year: y, limitLxh: 1000 }, 'c');
+
+    // ---- 阈值入参校验：0 < 低 < 高 ≤ 100；越权 ----
+    for (const bad of [
+      { year: y, lowPct: 80, highPct: 50 },
+      { year: y, lowPct: 0, highPct: 50 },
+      { year: y, lowPct: 50, highPct: 100.1 },
+      { year: y, lowPct: 100, highPct: 100 },
+      { year: 1800, lowPct: 50, highPct: 80 },
+    ]) {
+      const rr = await call('POST', `/api/exhibits/${exQ}/quota-thresholds`, bad, 'c');
+      assert(rr.status === 400, `非法阈值被拒 ${JSON.stringify(bad)}: ${rr.body && rr.body.error}`);
+    }
+    let rr = await call('POST', `/api/exhibits/${exQ}/quota-thresholds`,
+      { year: y, lowPct: 50, highPct: 80 }, 'i');
+    assert(rr.status === 403, '布展员不能设置预警阈值');
+
+    // ---- 首次设置：占用为 0，基线 none，不补发事件 ----
+    rr = await call('POST', `/api/exhibits/${exQ}/quota-thresholds`,
+      { year: y, lowPct: 50, highPct: 80 }, 'c');
+    assert(rr.status === 200, '保管员设置阈值');
+    assert(rr.body.threshold.lowPct === 50 && rr.body.threshold.highPct === 80,
+      '阈值回显 50/80');
+    assert(rr.body.threshold.baselineUsed === 0 && rr.body.threshold.baselineLevel === 'none',
+      '首次设置基线占用 0、级别 none');
+    assert((rr.body.quotaAlerts || []).length === 0, '首次设置不补发事件');
+    rr = await call('GET', `/api/exhibits/${exQ}`, null, 'i');
+    assert(rr.body.quotaThresholds.length === 1 && rr.body.quotaThresholds[0].level === 'none'
+      && rr.body.quotaAlertsUnread === 0, '登录用户可读阈值/事件，初始无预警');
+
+    // ---- 先设置阈值后再有占用：批准 600（60%）跨低档，一条 low ----
+    const qp1 = await submitPlan(exQ, '预警未来展1', `${y}-11-01`, `${y}-11-01`,
+      ['09:00-19:00'], 60); // 600
+    rr = await call('POST', `/api/plans/${qp1}/approve`, {}, 'c');
+    assert(rr.status === 200, '批准预警计划1');
+    assert(rr.body.quotaAlertEvents.length === 1 && rr.body.quotaAlertEvents[0].level === 'low'
+      && rr.body.quotaAlertEvents[0].triggerType === 'plan.approve'
+      && rr.body.quotaAlertEvents[0].previousLevel === 'none'
+      && rr.body.quotaAlertEvents[0].usedPct === 60,
+      '批准 60% 向上跨低档：1 条 low，快照占比 60%');
+
+    // ---- 再批准 300（30%）：合计 900（90%）跨高档，一条 high ----
+    const qp2 = await submitPlan(exQ, '预警未来展2', `${y}-11-02`, `${y}-11-02`,
+      ['09:00-14:00'], 60); // 300
+    rr = await call('POST', `/api/plans/${qp2}/approve`, {}, 'c');
+    assert(rr.status === 200, '批准预警计划2');
+    assert(rr.body.quotaAlertEvents.length === 1 && rr.body.quotaAlertEvents[0].level === 'high'
+      && rr.body.quotaAlertEvents[0].previousLevel === 'low',
+      '批准至 90% 向上跨高档：1 条 high，前级别 low');
+
+    // ---- 同级别不重复：取消再批不影响（下面用回落 + 重触发验证边沿）----
+    rr = await call('GET', `/api/exhibits/${exQ}`, null, 'i');
+    assert(rr.body.quotaThresholds[0].level === 'high' && rr.body.quotaAlertsUnread === 2,
+      '当前高档、未读 2');
+
+    // ---- 回落到低档（取消 qp2，占用 600）：不写事件；再次向上跨越可重触发 ----
+    rr = await call('POST', `/api/plans/${qp2}/cancel`, {}, 'c');
+    assert(rr.status === 200, '取消计划2占用回落');
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exQ}`, null, 'i');
+    assert(rr.body.events.length === 2, '回落不新增事件（仍 2 条）');
+    rr = await call('GET', `/api/exhibits/${exQ}`, null, 'i');
+    assert(rr.body.quotaThresholds[0].level === 'low', '回落后当前级别 low');
+    const qp3 = await submitPlan(exQ, '预警未来展3', `${y}-11-03`, `${y}-11-03`,
+      ['09:00-14:00'], 60); // 300
+    rr = await call('POST', `/api/plans/${qp3}/approve`, {}, 'c');
+    assert(rr.body.quotaAlertEvents.length === 1 && rr.body.quotaAlertEvents[0].level === 'high',
+      '回落后再次向上跨高档可重触发');
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exQ}`, null, 'i');
+    assert(rr.body.events.length === 3, '重触发后共 3 条事件');
+
+    // ---- 超上限：下调上限至 800（占用 900=112.5%），真实占用与最高级别如实显示 ----
+    rr = await call('POST', `/api/exhibits/${exQ}/limits`, { year: y, limitLxh: 800 }, 'c');
+    assert(rr.status === 200, '下调上限到 800');
+    // 已是 high，不再跨档：无新增事件
+    assert((rr.body.quotaAlertEvents || []).length === 0, '已在高档，下调上限不重复留事件');
+    rr = await call('GET', `/api/exhibits/${exQ}`, null, 'i');
+    const t = rr.body.quotaThresholds[0];
+    assert(t.level === 'high' && t.used === 900 && t.usedPct === 112.5 && t.limit === 800,
+      `超限仍真实显示 900/112.5%/high，实际 ${JSON.stringify(t)}`);
+    assert(rr.body.years[String(y)].used === 900 && rr.body.years[String(y)].over === true,
+      '占用 900、超限如实显示');
+
+    // ---- 触发来源覆盖：事故入账（在未来日期不可，用过去年份另建展品验证）----
+    const exQ2 = await createExhibit('预警事故展品');
+    const pastY = y - 1;
+    await call('POST', `/api/exhibits/${exQ2}/limits`, { year: pastY, limitLxh: 1000 }, 'c');
+    await call('POST', `/api/exhibits/${exQ2}/quota-thresholds`,
+      { year: pastY, lowPct: 50, highPct: 80 }, 'c');
+    // 已发生事故 600 lx·h（6h×100lx）跨低档
+    rr = await call('POST', '/api/incidents', {
+      exhibitId: exQ2,
+      startDate: `${pastY}-06-01`, startTime: '09:00',
+      endDate: `${pastY}-06-01`, endTime: '15:00',
+      actualLux: 100, reason: '预警触发测试事故',
+    }, 'c');
+    assert(rr.status === 201, '事故登记成功');
+    assert(rr.body.quotaAlertEvents.length === 1 && rr.body.quotaAlertEvents[0].level === 'low'
+      && rr.body.quotaAlertEvents[0].triggerType === 'incident.create',
+      '事故入账向上跨低档触发事件');
+
+    // ---- 停灯回落 + 事故重触发：先批准一条已开始过的计划不可行（未来限制）；
+    //      改为验证“上限上调使级别回落、再由事故重触发” ----
+    await call('POST', `/api/exhibits/${exQ2}/limits`, { year: pastY, limitLxh: 5000 }, 'c');
+    rr = await call('GET', `/api/exhibits/${exQ2}`, null, 'i');
+    assert(rr.body.quotaThresholds[0].level === 'none', '上限大幅上调后级别回落 none');
+    // 再来一次不相交事故 2500（5h×500lx）：合计 3100/5000=62% 跨 low
+    rr = await call('POST', '/api/incidents', {
+      exhibitId: exQ2,
+      startDate: `${pastY}-06-02`, startTime: '09:00',
+      endDate: `${pastY}-06-02`, endTime: '14:00',
+      actualLux: 500, reason: '第二次事故',
+    }, 'c');
+    assert(rr.status === 201 && rr.body.quotaAlertEvents.length === 1
+      && rr.body.quotaAlertEvents[0].level === 'low'
+      && rr.body.quotaAlertEvents[0].triggerType === 'incident.create',
+      '回落后事故再次向上跨低档，重触发');
+
+    // ---- 一次跨两级（none -> high）：各档各留一条事件 ----
+    const exQ3 = await createExhibit('预警跨级展品');
+    await call('POST', `/api/exhibits/${exQ3}/limits`, { year: y, limitLxh: 1000 }, 'c');
+    await call('POST', `/api/exhibits/${exQ3}/quota-thresholds`,
+      { year: y, lowPct: 50, highPct: 80 }, 'c');
+    const qpBig = await submitPlan(exQ3, '一步到位', `${y}-10-10`, `${y}-10-10`,
+      ['09:00-19:00'], 95); // 950 => 95%
+    rr = await call('POST', `/api/plans/${qpBig}/approve`, {}, 'c');
+    const lvls = (rr.body.quotaAlertEvents || []).map((e) => e.level).sort();
+    assert(lvls.length === 2 && lvls[0] === 'high' && lvls[1] === 'low',
+      '一次跨两级时 low/high 各一条事件');
+
+    // ---- 跨年独立判定 ----
+    const exQ4 = await createExhibit('预警跨年展品');
+    const nextY = y + 1;
+    await call('POST', `/api/exhibits/${exQ4}/limits`, { year: y, limitLxh: 1000 }, 'c');
+    await call('POST', `/api/exhibits/${exQ4}/limits`, { year: nextY, limitLxh: 1000 }, 'c');
+    await call('POST', `/api/exhibits/${exQ4}/quota-thresholds`,
+      { year: y, lowPct: 50, highPct: 80 }, 'c');
+    await call('POST', `/api/exhibits/${exQ4}/quota-thresholds`,
+      { year: nextY, lowPct: 50, highPct: 80 }, 'c');
+    const qpCross = await submitPlan(exQ4, '预警跨年计划',
+      `${y}-12-31`, `${nextY}-01-02`, ['09:00-17:00'], 60); // 480/天
+    rr = await call('POST', `/api/plans/${qpCross}/approve`, {}, 'c');
+    const cross = (rr.body.quotaAlertEvents || []).map((e) => `${e.year}:${e.level}`).sort();
+    // 当年 480/1000=48% 无事件；次年 960/1000=96% 跨两级两条
+    assert(cross.length === 2 && cross[0] === `${nextY}:high` && cross[1] === `${nextY}:low`,
+      `跨年独立：仅次年跨两级，实际 ${JSON.stringify(cross)}`);
+
+    // ---- 无上限：设阈值显示“无上限”、不触发；登记上限后下一次变动可触发 ----
+    // 注意：计划批准本身要求已登记上限，故用“计划外事故”（无需上限即可入账）构造占用。
+    const exQ5 = await createExhibit('预警无上限展品');
+    const noLimYear = y - 1;
+    rr = await call('POST', `/api/exhibits/${exQ5}/quota-thresholds`,
+      { year: noLimYear, lowPct: 50, highPct: 80 }, 'c');
+    assert(rr.body.threshold.hasLimit === false && rr.body.threshold.level === 'none'
+      && rr.body.threshold.usedPct === null, '无上限年份：hasLimit=false/level=none/占比 null');
+    rr = await call('POST', '/api/incidents', {
+      exhibitId: exQ5,
+      startDate: `${noLimYear}-09-09`, startTime: '09:00',
+      endDate: `${noLimYear}-09-09`, endTime: '15:00',
+      actualLux: 100, reason: '无上限年份事故（600 lx·h）',
+    }, 'c');
+    assert(rr.status === 201 && (rr.body.quotaAlertEvents || []).length === 0,
+      '事故无需上限即可入账；但无上限时不触发事件');
+    rr = await call('GET', `/api/exhibits/${exQ5}`, null, 'i');
+    assert(rr.body.quotaThresholds[0].hasLimit === false && rr.body.quotaThresholds[0].level === 'none'
+      && rr.body.quotaThresholds[0].used === 600,
+      '无上限即使占用 600 也不触发（显示无上限、级别 none，占用仍如实显示）');
+    // 登记上限 1000（占用 600 已存在）：last_level 仍为基线 none，上限变更使占比 60% 跨低档
+    rr = await call('POST', `/api/exhibits/${exQ5}/limits`, { year: noLimYear, limitLxh: 1000 }, 'c');
+    assert((rr.body.quotaAlertEvents || []).length === 1
+      && rr.body.quotaAlertEvents[0].level === 'low'
+      && rr.body.quotaAlertEvents[0].triggerType === 'limit.change'
+      && rr.body.quotaAlertEvents[0].usedPct === 60,
+      '登记上限后的同事务重算：既有占用已达 60%，向上跨低档');
+
+    // ---- 修改阈值重建基线：不补发；之后级别按新阈值 ----
+    rr = await call('POST', `/api/exhibits/${exQ}/quota-thresholds`,
+      { year: y, lowPct: 30, highPct: 60 }, 'c');
+    assert(rr.body.threshold.baselineUsed === 900 && rr.body.threshold.baselineLevel === 'high',
+      '修改阈值以当时占用 900/high 重建基线');
+    const beforeCount = (await call('GET', `/api/quota-alerts?exhibitId=${exQ}`, null, 'i'))
+      .body.events.length;
+    assert(beforeCount === 3, '重建基线不补发事件（仍 3 条）');
+
+    // ---- 标记已读：布展员 403；保管员单条/批量；不改级别 ----
+    let evs = (await call('GET', `/api/quota-alerts?exhibitId=${exQ}`, null, 'i')).body.events;
+    rr = await call('POST', `/api/quota-alerts/${evs[0].id}/read`, {}, 'i');
+    assert(rr.status === 403, '布展员不能标记已读');
+    rr = await call('POST', `/api/quota-alerts/${evs[0].id}/read`, {}, 'c');
+    assert(rr.status === 200 && rr.body.event.readAt !== null, '保管员单条标记已读');
+    rr = await call('POST', `/api/quota-alerts/${evs[0].id}/read`, {}, 'c');
+    assert(rr.status === 200 && rr.body.event.readAt !== null, '重复标记已读幂等');
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exQ}&unreadOnly=1`, null, 'i');
+    assert(rr.body.events.length === 2, '剩 2 条未读');
+    rr = await call('POST', '/api/quota-alerts/999999/read', {}, 'c');
+    assert(rr.status === 400, '不存在事件标记已读 400');
+    rr = await call('GET', `/api/exhibits/${exQ}`, null, 'i');
+    assert(rr.body.quotaThresholds[0].level === 'high', '已读不改变当前预警级别');
+    rr = await call('POST', '/api/quota-alerts/read-all', { exhibitId: exQ }, 'c');
+    assert(rr.body.updatedCount === 2, '批量标记剩余 2 条已读');
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exQ}`, null, 'i');
+    assert(rr.body.unreadCount === 0 && rr.body.events.every((e) => e.readAt !== null),
+      '该展品事件全部已读');
+
+    // ---- 查询过滤与全局列表（登录可读）----
+    rr = await call('GET', `/api/quota-alerts?exhibitId=${exQ3}&level=high`, null, 'i');
+    assert(rr.body.events.every((e) => e.exhibitId === exQ3 && e.level === 'high'),
+      '按展品 + 级别过滤事件');
+    rr = await call('GET', `/api/quota-alerts?year=${nextY}`, null, 'i');
+    assert(rr.body.events.length >= 2 && rr.body.events.every((e) => e.year === nextY),
+      '按年份过滤事件');
+    rr = await call('GET', '/api/quota-alerts/unread-count', null, 'i');
+    assert(typeof rr.body.unreadCount === 'number', '未读计数接口');
+    rr = await call('GET', '/api/quota-alerts', null, 'c');
+    assert(rr.body.events.length >= 8, '全局预警事件列表包含本轮全部触发');
+
+    // ---- 操作流水含阈值设置/修改 ----
+    rr = await call('GET', '/api/audit?targetType=annual_quota_threshold&limit=20', null, 'c');
+    const actions = rr.body.events.map((e) => e.action).sort();
+    assert(actions.includes('quota_threshold.create') && actions.includes('quota_threshold.update'),
+      '审计记录阈值的设置与修改');
+
+    // ---- 回滚一致性：批准失败（超限）事务回滚，事件不残留 ----
+    const totalBefore = (await call('GET', '/api/quota-alerts?limit=1000', null, 'i')).body.events.length;
+    const qpBad = await submitPlan(exQ, '必然超限计划', `${y}-12-09`, `${y}-12-09`,
+      ['09:00-19:00'], 500); // 5000，必超 800 上限
+    rr = await call('POST', `/api/plans/${qpBad}/approve`, {}, 'c');
+    assert(rr.status === 409, '超限批准仍被拒绝（409）');
+    const totalAfterAll = (await call('GET', '/api/quota-alerts?limit=1000', null, 'i')).body.events.length;
+    assert(totalBefore === totalAfterAll, '被回滚的批准不残留预警事件');
+
+    // ---- 列表接口附加当前级别计数 ----
+    rr = await call('GET', '/api/exhibits', null, 'i');
+    const card = rr.body.exhibits.find((e) => e.id === exQ);
+    assert(card && card.quotaAlertsConfigured >= 1 && card.quotaAlertHigh >= 1,
+      '展品列表附加分级预警当前级别计数');
+  }
 }
 
 main().catch((err) => {

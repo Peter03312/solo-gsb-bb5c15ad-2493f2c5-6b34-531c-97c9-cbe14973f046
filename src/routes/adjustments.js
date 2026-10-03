@@ -18,6 +18,7 @@ const {
   dateYmd,
 } = require('../service');
 const { exhibitDetail } = require('./exhibits');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -583,6 +584,15 @@ router.post('/pair/approve', requireRole('conservator'), async (req, res, next) 
         });
       }
 
+      // 成对核准生效后同一展品锁事务内重算分级预警边沿（失败回滚时事件一并回滚）
+      const { events: alertEvents } = await alerts.recomputeAlerts(client, exhibitId, {
+        actor: req.sessionUser,
+        trigger: {
+          type: 'plan.adjustment.pair_approve',
+          detail: { adjustmentIds: [idA, idB], planIds: [planA.id, planB.id] },
+        },
+      });
+
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {
         ...detailAfter,
@@ -592,6 +602,7 @@ router.post('/pair/approve', requireRole('conservator'), async (req, res, next) 
           items: evalResult.items,
           yearlyReport: evalResult.yearlyReport,
         },
+        quotaAlertEvents: alertEvents,
       };
     });
 
@@ -693,7 +704,23 @@ router.post('/:id/approve', requireRole('conservator'), async (req, res, next) =
         newResidueYearly: evalResult.newResidueYearly,
       });
 
-      return exhibitDetail(client, plan.exhibit_id, { lock: true });
+      // 调整生效后占用可能变化：同一展品锁事务内重算分级预警边沿
+      const { events: alertEvents } = await alerts.recomputeAlerts(client, plan.exhibit_id, {
+        actor: req.sessionUser,
+        trigger: {
+          type: 'plan.adjustment.approve',
+          detail: {
+            adjustmentId: id, planId: plan.id,
+            oldResidueYearly: evalResult.oldResidueYearly,
+            newResidueYearly: evalResult.newResidueYearly,
+          },
+        },
+      });
+
+      return {
+        ...(await exhibitDetail(client, plan.exhibit_id, { lock: true })),
+        quotaAlertEvents: alertEvents,
+      };
     });
 
     res.json(detail);

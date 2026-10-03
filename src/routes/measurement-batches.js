@@ -27,6 +27,7 @@ const {
 } = require('../service');
 const { round3 } = require('../dosing');
 const { parseMeasurementCsvRows } = require('../csv');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -465,6 +466,17 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         });
       }
 
+      // 批次确认入账（含可能的待复核转态）后：锁事务内重算分级预警边沿
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, exhibitId, {
+          actor: req.sessionUser,
+          trigger: {
+            type: 'measurement_batch.confirm',
+            detail: { batchId: id, measurementIds, totalYearly },
+          },
+        }
+      );
+
       const confirmResult = {
         rowCount: evaluated.length,
         measurementIds,
@@ -500,7 +512,7 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         [id]
       )).rows[0];
       const detail = await exhibitDetail(client, exhibitId, { lock: true });
-      return { duplicate: false, batch: updated, confirmResult, detail, overflows, flagged };
+      return { duplicate: false, batch: updated, confirmResult, detail, overflows, flagged, alertEvents };
     });
 
     if (result.duplicate) {
@@ -515,6 +527,7 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
       batch: serializeMeasurementBatch(result.batch),
       confirmResult: result.confirmResult,
       detail: result.detail,
+      quotaAlertEvents: result.alertEvents,
     };
     if (result.overflows.length > 0) {
       // 批次已确认入账，但触发超限：用 409 明确报告年份、超额量及被转待复核的计划

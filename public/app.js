@@ -52,6 +52,38 @@ const STATUS_TEXT = {
   draft: '待确认', confirmed: '已确认', annulled: '已作废',
   pending: '待审', withdrawn: '已撤回',
 };
+// 分级预警
+const ALERT_LEVEL_TEXT = { none: '正常', low: '低档预警', high: '高档预警' };
+const ALERT_TRIGGER_TEXT = {
+  'plan.approve': '计划批准',
+  'plan.reapprove': '计划复核通过',
+  'plan.cancel': '计划取消',
+  'plan.adjustment.approve': '调整生效',
+  'plan.adjustment.pair_approve': '成对核准生效',
+  'plan.batch_approve': '联合核准',
+  'measurement.confirm': '实测确认',
+  'measurement.correct': '实测纠错',
+  'measurement_batch.confirm': '实测批次确认',
+  'blackout.create': '停灯登记',
+  'incident.create': '照明事故',
+  'shared_lighting.create': '共享照明入账',
+  'limit.change': '上限变更',
+  recompute: '占用重算',
+};
+function alertLevelHtml(level) {
+  const cls = level === 'high' ? 'high' : level === 'low' ? 'low' : 'none';
+  return `<span class="alert-level ${cls}">${ALERT_LEVEL_TEXT[level] || level}</span>`;
+}
+function alertTag(level) {
+  return `<span class="alert-tag ${level}">${ALERT_LEVEL_TEXT[level] || level}</span>`;
+}
+function alertTriggerText(t) {
+  return ALERT_TRIGGER_TEXT[t] || t;
+}
+function fmtDateTime(v) {
+  if (!v) return '—';
+  return String(v).replace('T', ' ').slice(0, 16);
+}
 function badge(status) {
   return `<span class="badge ${esc(status)}">${STATUS_TEXT[status] || esc(status)}</span>`;
 }
@@ -87,6 +119,7 @@ function showApp() {
   applyRoleVisibility();
   $('#user-info').textContent = `${state.user.displayName}（${state.user.role === 'conservator' ? '保管员' : '布展员'}）`;
   switchTab(state.user.role === 'installer' ? 'plans' : 'exhibits');
+  refreshAlertUnreadBadge();
 }
 function applyRoleVisibility() {
   const isConservator = state.user.role === 'conservator';
@@ -126,8 +159,21 @@ async function switchTab(tab) {
   if (tab === 'exhibits') await loadExhibits();
   if (tab === 'plans') await loadPlans();
   if (tab === 'measurements') await loadMeasurementsTab();
+  if (tab === 'alerts') await loadAlertsTab();
   if (tab === 'users') await loadUsers();
   if (tab === 'audit') await loadAudit();
+}
+
+async function refreshAlertUnreadBadge(exhibitId) {
+  try {
+    const q = exhibitId ? `?exhibitId=${exhibitId}` : '';
+    const { unreadCount } = await api('GET', `/api/quota-alerts/unread-count${q}`);
+    const el = $('#alerts-nav-unread');
+    if (el) {
+      el.textContent = unreadCount > 99 ? '99+' : String(unreadCount);
+      el.classList.toggle('hidden', !unreadCount);
+    }
+  } catch (_) { /* 未登录等场景忽略 */ }
 }
 
 // ---------- 展品与额度 ----------
@@ -140,14 +186,24 @@ async function loadExhibits() {
   } else {
     list.innerHTML = exhibits.map((e) => {
       const years = Object.values(e.years || {});
+      // 列表接口未附加阈值时退化为只用 over/剩余额度着色
       const chips = years.map((y) => {
         const cls = y.over ? 'over' : y.remaining !== null && y.remaining < y.limit * 0.1 ? 'warn' : '';
         return `<div class="chip ${cls}"><span>${y.year} 年剩余</span>
-          <span class="mono">${y.limit === null ? '未设上限' : `${fmtN(y.remaining)} / ${fmtN(y.limit)} lx·h`}</span></div>`;
+          <span class="mono">${y.limit === null ? '无上限' : `${fmtN(y.remaining)} / ${fmtN(y.limit)} lx·h`}</span></div>`;
       }).join('');
+      const highAlerts = (e.quotaAlertHigh || 0);
+      const lowAlerts = (e.quotaAlertLow || 0);
+      const alertBanner = (e.quotaAlertsConfigured || 0) > 0
+        ? `<div class="small" style="margin-top:6px">分级预警：` +
+          (highAlerts ? `<span class="alert-tag high">${highAlerts} 个年份高档</span> ` : '') +
+          (!highAlerts && lowAlerts ? `<span class="alert-tag low">${lowAlerts} 个年份低档</span> ` : '') +
+          (!highAlerts && !lowAlerts ? '<span class="muted">未触发</span>' : '') +
+          `</div>` : '';
       return `<div class="card exhibit-card" data-id="${e.id}">
         <h3>${esc(e.name)}</h3>
         <div class="acc">${esc(e.accession_no || '—')}${e.medium ? ' · ' + esc(e.medium) : ''}</div>
+        ${alertBanner}
         <div class="year-chips">${chips || '<span class="muted small">尚未登记年度额度</span>'}</div>
       </div>`;
     }).join('');
@@ -179,6 +235,7 @@ async function openDetail(id) {
   hideLimitPreview();
   $('#pair-result').innerHTML = '';
   renderDetail();
+  refreshAlertUnreadBadge();
 }
 $('#close-detail').addEventListener('click', () => {
   state.detail = null;
@@ -194,14 +251,22 @@ function renderDetail() {
     `编号：${d.exhibit.accession_no || '—'}　材质：${d.exhibit.medium || '—'}${d.exhibit.note ? '　备注：' + d.exhibit.note : ''}`;
 
   const years = Object.values(d.years);
-  $('#year-tbody').innerHTML = years.length ? years.map((y) => `<tr class="${y.over ? 'over-row' : ''}">
+  const thresholdByYear = new Map((d.quotaThresholds || []).map((t) => [t.year, t]));
+  $('#year-tbody').innerHTML = years.length ? years.map((y) => {
+    const t = thresholdByYear.get(y.year);
+    const warnCell = !t ? '<span class="muted small">未设置阈值</span>'
+      : !t.hasLimit ? '<span class="muted small">无上限（不触发）</span>'
+      : alertLevelHtml(t.level);
+    return `<tr class="${y.over ? 'over-row' : t && t.level === 'high' ? 'row-high' : t && t.level === 'low' ? 'row-low' : ''}">
       <td>${y.year}</td>
-      <td class="mono">${y.limit === null ? '未登记' : fmtN(y.limit)}</td>
+      <td class="mono">${y.limit === null ? '无上限' : fmtN(y.limit)}</td>
       <td class="mono">${fmtN(y.used)}</td>
       <td class="mono">${y.remaining === null ? '—' : fmtN(y.remaining)}</td>
-      <td>${y.limit === null ? '<span class="muted">无法核算</span>'
+      <td>${y.limit === null ? '<span class="muted">无上限</span>'
         : y.over ? `<b style="color:#b42318">超限 ${fmtN(y.used - y.limit)}</b>` : '正常'}</td>
-    </tr>`).join('') : '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
+      <td>${warnCell}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="6" class="muted">暂无数据</td></tr>';
 
   $('#sources-list').innerHTML = (d.sources || []).map((s) => {
     if (s.kind === 'measurement') {
@@ -240,6 +305,7 @@ function renderDetail() {
   renderResidences(d);
   renderSharedLightings(d);
   renderLedgers(d);
+  renderThresholds(d);
 
   $$('.plan-action').forEach((btn) => btn.addEventListener('click', () => planAction(btn)));
   $$('.meas-action').forEach((btn) => btn.addEventListener('click', () => measAction(btn)));
@@ -335,6 +401,171 @@ $('#ledger-form')?.addEventListener('submit', async (e) => {
     e.target.reset();
     await openDetail(state.detail.exhibit.id);
     flash('success', `${year} 年用光账册已封存（旧账不可修改或覆盖）`);
+  } catch (err) {
+    flash('error', err.message);
+  }
+});
+
+/** 渲染分级预警阈值表 + 本展品触发历史；绑定保管员的阈值设置/标记已读操作。 */
+function renderThresholds(d) {
+  const tbody = $('#threshold-tbody');
+  if (!tbody) return;
+  const list = d.quotaThresholds || [];
+  tbody.innerHTML = list.length ? list.map((t) => `
+    <tr class="${t.level === 'high' ? 'row-high' : t.level === 'low' ? 'row-low' : ''}">
+      <td>${t.year}</td>
+      <td class="mono">${t.hasLimit ? fmtN(t.limit) : '无上限'}</td>
+      <td class="mono">${fmtN(t.lowPct)}%</td>
+      <td class="mono">${fmtN(t.highPct)}%</td>
+      <td class="mono">${fmtN(t.used)}</td>
+      <td class="mono">${t.usedPct === null ? '—' : fmtN(t.usedPct) + '%'}</td>
+      <td>${alertLevelHtml(t.level)}</td>
+      <td class="small muted">${fmtN(t.baselineUsed)} lx·h · ${ALERT_LEVEL_TEXT[t.baselineLevel] || t.baselineLevel}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="8" class="muted">尚未设置任何年份的预警阈值。保管员可在上方表单设置。</td></tr>';
+
+  const listBox = $('#detail-alert-list');
+  const events = d.quotaAlerts || [];
+  listBox.innerHTML = events.length ? `<table class="data">
+    <thead><tr><th>#</th><th>年份</th><th>级别</th><th>上限</th><th>占用（占比）</th><th>触发来源</th><th>时间</th><th>状态/操作</th></tr></thead>
+    <tbody>${events.map(alertDetailRow).join('')}</tbody></table>`
+    : '<p class="muted small">尚无预警事件（阈值首次设置/修改不补发；仅占用向上跨档时记录）。</p>';
+  $$('.detail-alert-read').forEach((btn) => btn.addEventListener('click', () =>
+    markAlertRead(Number(btn.dataset.id), btn)));
+}
+
+/** 单条预警事件的表格行（展品详情与全局预警页共用）。 */
+function alertDetailRow(ev, { withExhibit = false } = {}) {
+  const read = !!ev.readAt;
+  const pct = ev.usedPct;
+  const isCustodian = state.user && state.user.role === 'conservator';
+  return `<tr class="${ev.level === 'high' ? 'row-high' : 'row-low'}">
+    <td>${ev.id}</td>
+    ${withExhibit ? `<td>#${ev.exhibitId}</td>` : ''}
+    <td>${ev.year}</td>
+    <td>${alertTag(ev.level)}</td>
+    <td class="mono">${ev.limit === null ? '无上限' : fmtN(ev.limit)}</td>
+    <td class="mono">${fmtN(ev.used)}（${fmtN(pct)}%）<div class="small muted">阈值 ${fmtN(ev.lowPct)}% / ${fmtN(ev.highPct)}%</div></td>
+    <td class="small">${esc(alertTriggerText(ev.triggerType))}</td>
+    <td class="small">${fmtDateTime(ev.createdAt)}</td>
+    <td class="small"><span class="read-dot ${read ? 'read' : 'unread'}"></span>${read ? '已读' : '未读'}
+      ${!read && isCustodian ? `<button class="small-btn detail-alert-read" data-id="${ev.id}">标记已读</button>` : ''}</td>
+  </tr>`;
+}
+
+$('#threshold-form')?.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!state.detail) return;
+  const fd = new FormData(e.target);
+  const body = {
+    year: Number(fd.get('year')),
+    lowPct: Number(fd.get('lowPct')),
+    highPct: Number(fd.get('highPct')),
+  };
+  try {
+    await api('POST', `/api/exhibits/${state.detail.exhibit.id}/quota-thresholds`, body);
+    e.target.reset();
+    await openDetail(state.detail.exhibit.id);
+    refreshAlertUnreadBadge();
+    flash('success', `已保存 ${body.year} 年预警阈值，并以当时占用重建基线（不补发历史事件）`);
+  } catch (err) {
+    flash('error', err.message);
+  }
+});
+
+$('#threshold-mark-read-btn')?.addEventListener('click', async () => {
+  if (!state.detail) return;
+  try {
+    const r = await api('POST', '/api/quota-alerts/read-all',
+      { exhibitId: state.detail.exhibit.id });
+    await openDetail(state.detail.exhibit.id);
+    refreshAlertUnreadBadge();
+    flash('success', `已标记 ${r.updatedCount} 条事件为已读（预警级别不变）`);
+  } catch (err) {
+    flash('error', err.message);
+  }
+});
+
+async function markAlertRead(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await api('POST', `/api/quota-alerts/${id}/read`);
+    if (state.detail) await openDetail(state.detail.exhibit.id);
+    if ($('#tab-alerts') && !$('#tab-alerts').classList.contains('hidden')) await loadAlertsTab();
+    refreshAlertUnreadBadge();
+  } catch (err) {
+    flash('error', err.message);
+    if (btn) btn.disabled = false;
+  }
+}
+
+// 全局预警页：事件列表（登录可读）+ 保管员标记已读
+async function loadAlertsTab() {
+  const form = $('#alerts-filter-form');
+  const params = new URLSearchParams();
+  if (form) {
+    const fd = new FormData(form);
+    const exId = Number(fd.get('exhibitId'));
+    const year = Number(fd.get('year'));
+    const level = fd.get('level');
+    if (Number.isInteger(exId) && exId > 0) params.set('exhibitId', exId);
+    if (Number.isInteger(year) && year > 0) params.set('year', year);
+    if (level) params.set('level', level);
+    if (fd.get('unreadOnly') === 'on') params.set('unreadOnly', '1');
+  }
+  const { events } = await api('GET', `/api/quota-alerts?${params.toString()}`);
+  // 补展品名称
+  let nameById = new Map();
+  try {
+    const { exhibits } = await api('GET', '/api/exhibits');
+    nameById = new Map(exhibits.map((x) => [Number(x.id), x.name]));
+  } catch (_) {}
+  const tbody = $('#alerts-tbody');
+  tbody.innerHTML = events.length
+    ? events.map((ev) => globalAlertRow(ev, nameById)).join('')
+    : '<tr><td colspan="10" class="muted">暂无预警事件</td></tr>';
+  $$('.detail-alert-read').forEach((btn) => btn.addEventListener('click', () =>
+    markAlertRead(Number(btn.dataset.id), btn)));
+  refreshAlertUnreadBadge();
+}
+
+function globalAlertRow(ev, nameById) {
+  const read = !!ev.readAt;
+  const isCustodian = state.user && state.user.role === 'conservator';
+  return `<tr class="${ev.level === 'high' ? 'row-high' : 'row-low'}">
+    <td>${ev.id}</td>
+    <td>#${ev.exhibitId} ${esc(nameById.get(ev.exhibitId) || '')}</td>
+    <td>${ev.year}</td>
+    <td>${alertTag(ev.level)}</td>
+    <td class="mono">${ev.limit === null ? '无上限' : fmtN(ev.limit)}</td>
+    <td class="mono">${fmtN(ev.used)}（${fmtN(ev.usedPct)}%）<div class="small muted">阈值 ${fmtN(ev.lowPct)}% / ${fmtN(ev.highPct)}%</div></td>
+    <td class="small">${esc(alertTriggerText(ev.triggerType))}</td>
+    <td class="small">${fmtDateTime(ev.createdAt)}</td>
+    <td class="small"><span class="read-dot ${read ? 'read' : 'unread'}"></span>${read ? '已读' : '未读'}
+      ${!read && isCustodian ? `<button class="small-btn detail-alert-read" data-id="${ev.id}">标记已读</button>` : ''}</td>
+  </tr>`;
+}
+
+$('#alerts-filter-form')?.addEventListener('submit', (e) => {
+  e.preventDefault();
+  loadAlertsTab().catch((err) => flash('error', err.message));
+});
+$('#alerts-mark-all-read')?.addEventListener('click', async () => {
+  const form = $('#alerts-filter-form');
+  const body = {};
+  if (form) {
+    const fd = new FormData(form);
+    const exId = Number(fd.get('exhibitId'));
+    const year = Number(fd.get('year'));
+    const level = fd.get('level');
+    if (Number.isInteger(exId) && exId > 0) body.exhibitId = exId;
+    if (Number.isInteger(year) && year > 0) body.year = year;
+    if (level) body.level = level;
+  }
+  try {
+    const r = await api('POST', '/api/quota-alerts/read-all', body);
+    await loadAlertsTab();
+    flash('success', `已标记 ${r.updatedCount} 条事件为已读`);
   } catch (err) {
     flash('error', err.message);
   }

@@ -17,6 +17,7 @@ const {
   registerBlackout,
 } = require('../service');
 const { wallToTs, tsToWallString, yearMapToObject, doseByYear } = require('../dosing');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -159,6 +160,14 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         estimatedDeductionYearly: yearly,
       });
 
+      // 停灯扣减估算后占用下降：锁事务内重算预警（回落不写事件，仅刷新最近级别）
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, plan.exhibit_id, {
+          actor: req.sessionUser,
+          trigger: { type: 'blackout.create', detail: { blackoutId: Number(row.id), planId: plan.id, yearly } },
+        }
+      );
+
       const { exhibitDetail } = require('./exhibits');
       const detailAfter = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       // 取登记人名（拆简单查询，规避内存驱动 JOIN 缺陷）
@@ -171,6 +180,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       return {
         ...detailAfter,
         blackout: serializeBlackout({ ...created, plan_title: plan.title, plan_status: plan.status, creator_name: creatorName, yearly }),
+        quotaAlertEvents: alertEvents,
       };
     });
 

@@ -30,6 +30,7 @@
         <button data-tab="exhibits" class="tab active">展品与额度</button>
         <button data-tab="plans" class="tab">布展计划</button>
         <button data-tab="measurements" class="tab">实测记录</button>
+        <button data-tab="alerts" class="tab">用光预警<span id="alerts-nav-unread" class="nav-unread hidden"></span></button>
         <button data-tab="users" class="tab conservator-only">账号</button>
         <button data-tab="audit" class="tab conservator-only">操作流水</button>
       </nav>
@@ -59,7 +60,7 @@
 
           <h4>各自然年额度（lx·h）</h4>
           <table class="data">
-            <thead><tr><th>年份</th><th>年度上限</th><th>已占用</th><th>剩余额度</th><th>状态</th></tr></thead>
+            <thead><tr><th>年份</th><th>年度上限</th><th>已占用</th><th>剩余额度</th><th>状态</th><th>分级预警</th></tr></thead>
             <tbody id="year-tbody"></tbody>
           </table>
 
@@ -77,6 +78,30 @@
           </p>
 
           <div id="limit-preview-box" class="card hidden conservator-only"></div>
+
+          <h4>分级预警阈值（年度上限占比）</h4>
+          <p class="muted small">保管员按展品 + 自然年设置<b>低、高两档</b>阈值（0 &lt; 低档 &lt; 高档 ≤ 100，单位为年度上限的百分比）。
+            未登记年度上限时显示「无上限」且不触发；<b>首次设置或修改阈值以当时占用重建基线、不补发历史事件</b>。
+            此后计划批准/取消/调整、上限变更、实测确认/纠错、停灯、事故、展厅共享照明入账时，
+            在展品锁事务内按统一剂量口径重算：占用<b>向上跨过</b>每档才各留一条事件，回落后再次跨越可重触发；跨年独立；
+            超上限仍显示真实占用与最高级别。登录用户可查看当前占用、级别与触发历史；保管员可标记已读（不改变级别）。</p>
+          <form id="threshold-form" class="inline-form conservator-only">
+            <span>设置/修改预警阈值：</span>
+            <input name="year" type="number" min="1900" max="2999" placeholder="年份，如 2026" required />
+            <input name="lowPct" type="number" step="0.1" min="0.1" max="99.9" placeholder="低档 %（如 60）" required />
+            <input name="highPct" type="number" step="0.1" min="0.1" max="100" placeholder="高档 %（如 90）" required />
+            <button class="primary">保存阈值（重建基线）</button>
+          </form>
+          <table class="data">
+            <thead><tr><th>年份</th><th>上限</th><th>低档</th><th>高档</th><th>当前占用</th><th>占比</th><th>当前级别</th><th>基线（设置/修改当时）</th></tr></thead>
+            <tbody id="threshold-tbody"></tbody>
+          </table>
+
+          <div class="panel-head" style="margin-top:16px">
+            <h4>预警触发历史</h4>
+            <button type="button" id="threshold-mark-read-btn" class="small-btn conservator-only">全部标记已读</button>
+          </div>
+          <div id="detail-alert-list"></div>
 
           <h4>额度占用来源</h4>
           <div id="sources-list"></div>
@@ -284,6 +309,33 @@
           <p class="muted small">确认后该时段以实测剂量替代估算；重叠实测会被拒绝。若迟到实测导致超限，相应年度尚未开始的计划自动转「待复核」。</p>
         </form>
         <div id="meas-list"></div>
+      </section>
+
+      <!-- 用光分级预警（登录可见；保管员可标记已读） -->
+      <section id="tab-alerts" class="tab-panel hidden">
+        <div class="panel-head">
+          <h2>年度用光分级预警</h2>
+          <button id="alerts-mark-all-read" class="conservator-only">全部标记已读</button>
+        </div>
+        <p class="muted small">占用向上跨过低档/高档阈值时留下的可追溯事件；回落后再次跨越会重新触发。
+          事件随触发操作在同一展品锁事务内写入，操作回滚时事件一并回滚。标记已读不改变预警级别。</p>
+        <form id="alerts-filter-form" class="inline-form">
+          <label>展品 #<input name="exhibitId" type="number" min="1" placeholder="全部展品" style="width:110px" /></label>
+          <label>年份<input name="year" type="number" min="1900" max="2999" placeholder="全部年份" style="width:110px" /></label>
+          <label>级别
+            <select name="level">
+              <option value="">全部</option>
+              <option value="low">低档</option>
+              <option value="high">高档</option>
+            </select>
+          </label>
+          <label><input type="checkbox" name="unreadOnly" /> 仅未读</label>
+          <button class="primary" type="submit">筛选</button>
+        </form>
+        <table class="data">
+          <thead><tr><th>#</th><th>展品</th><th>年份</th><th>级别</th><th>上限</th><th>占用</th><th>占比</th><th>触发来源</th><th>时间</th><th>状态/操作</th></tr></thead>
+          <tbody id="alerts-tbody"></tbody>
+        </table>
       </section>
 
       <!-- 账号 -->

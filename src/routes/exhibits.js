@@ -15,6 +15,7 @@ const {
   serializeLedger,
   buildYearSnapshot,
 } = require('../ledger');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -109,6 +110,14 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     ledgers.push(serializeLedger(row, diffSnapshots(sealedSnap, currentSnap)));
   }
 
+  // 年度用光额度分级预警（仅附加字段，既有消费者不受影响）：
+  //   quotaThresholds    各已设置年份的低/高档阈值与当前占用、占比、级别（未登记上限显示无上限且 level=none）
+  //   quotaAlerts        触发事件历史（按时间倒序，含已读标记）
+  //   quotaAlertsUnread  该展品未读事件条数
+  const quotaThresholds = await alerts.buildThresholdView(client, exhibitId, occupancy);
+  const quotaAlerts = await alerts.listAlerts(client, { exhibitId, limit: 200 });
+  const quotaAlertsUnread = await alerts.countUnread(client, exhibitId);
+
   // 实测 CSV 导入批次（待确认/已确认；仅附加字段，既有字段不变）
   // 延迟 require 以避免与 routes/measurement-batches 形成循环依赖
   const { serializeMeasurementBatch } = require('./measurement-batches');
@@ -140,6 +149,9 @@ async function exhibitDetail(client, exhibitId, { lock = false } = {}) {
     sharedLightingDoseYearly,
     ledgers,
     measurementBatches,
+    quotaThresholds,
+    quotaAlerts,
+    quotaAlertsUnread,
   };
 }
 
@@ -232,14 +244,27 @@ async function applyLowerAndFlag(client, actor, exhibitId, year, previousLimit, 
   };
 }
 
-// 展品列表（带每展品年度额度概况）
+// 展品列表（带每展品年度额度概况 + 分级预警当前级别计数，仅附加字段）
 router.get('/', async (req, res, next) => {
   try {
     const { rows } = await query('SELECT * FROM exhibits ORDER BY id');
     const items = [];
     for (const e of rows) {
       const occupancy = await computeOccupancy({ query }, e.id);
-      items.push({ ...e, years: occupancy.years });
+      const thresholds = await alerts.buildThresholdView({ query }, e.id, occupancy);
+      let quotaAlertHigh = 0;
+      let quotaAlertLow = 0;
+      for (const t of thresholds) {
+        if (t.level === 'high') quotaAlertHigh += 1;
+        else if (t.level === 'low') quotaAlertLow += 1;
+      }
+      items.push({
+        ...e,
+        years: occupancy.years,
+        quotaAlertsConfigured: thresholds.length,
+        quotaAlertHigh,
+        quotaAlertLow,
+      });
     }
     res.json({ exhibits: items });
   } catch (err) {
@@ -384,6 +409,13 @@ router.post('/:id/limits/lower', requireRole('conservator'), async (req, res, ne
         { auditAction: 'limit.lower' }
       );
 
+      // 上限下调：同一展品锁事务内重算分级预警边沿（可能向上跨档）
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, exhibitId, { actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
+          year, previousLimit, newLimit: limitLxh, viaVoucher: true,
+        } } }
+      );
+
       // 成功响应与既有额度修改接口兼容：展品详情字段位于顶层
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {
@@ -393,10 +425,36 @@ router.post('/:id/limits/lower', requireRole('conservator'), async (req, res, ne
         newLimit: limitLxh,
         flaggedPlans: flagged,
         overflows,
+        quotaAlertEvents: alertEvents,
       };
     });
 
     res.json(detail);
+  } catch (err) {
+    next(err);
+  }
+});
+
+/**
+ * 保管员按展品 + 自然年设置/修改分级预警阈值（低档、高档，年度上限占比百分比；
+ * 0 < 低 < 高 ≤ 100）。首次设置或修改都以“当时占用”重建基线，不补发历史事件。
+ * 未登记年度上限的年份也可设置：该年显示“无上限”且不触发，待上限登记后的下一次
+ * 占用/上限变动重算时才可能向上跨档。成功响应为展品详情（兼容字段位于顶层），另附 threshold。
+ */
+router.post('/:id/quota-thresholds', requireRole('conservator'), async (req, res, next) => {
+  try {
+    const exhibitId = Number(req.params.id);
+    const input = alerts.parseThresholdInput(req.body || {});
+    const detail = await withExhibitTransaction(exhibitId, async (client) => {
+      const { rebased } = await alerts.upsertThreshold(
+        client, exhibitId, input, req.sessionUser
+      );
+      const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
+      const threshold = (detailAfter.quotaThresholds || [])
+        .find((t) => t.year === input.year) || null;
+      return { ...detailAfter, threshold, rebased };
+    });
+    res.status(200).json(detail);
   } catch (err) {
     next(err);
   }
@@ -443,6 +501,14 @@ router.post('/:id/limits', requireRole('conservator'), async (req, res, next) =>
           lowered: false,
         });
       }
+
+      // 上限变更：在同一展品锁事务内按统一剂量口径重算分级预警边沿（上限下调路径同样适用）
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, exhibitId, { actor: req.sessionUser, trigger: { type: 'limit.change', detail: {
+          year, previousLimit, newLimit: limitLxh,
+        } } }
+      );
+
       const detailAfter = await exhibitDetail(client, exhibitId, { lock: true });
       return {
         ...detailAfter,
@@ -452,6 +518,7 @@ router.post('/:id/limits', requireRole('conservator'), async (req, res, next) =>
           : null,
         flaggedPlans: lowerOutcome.flagged,
         overflows: lowerOutcome.overflows,
+        quotaAlertEvents: alertEvents,
       };
     });
     res.json(detail);

@@ -33,6 +33,7 @@ const {
 } = require('../dosing');
 const { ConflictError, AuthError } = require('../validation');
 const { exhibitDetail } = require('./exhibits');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -313,17 +314,31 @@ router.post('/batch/approve', requireRole('conservator'), async (req, res, next)
         exhibits: evalResult.exhibits,
       };
 
+      // 联合核准后逐展品（已按 id 升序持锁）重算分级预警边沿；整组失败时本事务回滚、事件一并回滚
+      const alertEventsByExhibit = [];
+      for (const exId of exhibitIds) {
+        const { events } = await alerts.recomputeAlerts(client, exId, {
+          actor: req.sessionUser,
+          trigger: { type: 'plan.batch_approve', detail: { planIds: ids } },
+        });
+        alertEventsByExhibit.push({ exhibitId: exId, events });
+      }
+
       // 成功响应：单展品时与既有单条批准同构（展品详情顶层字段保持兼容）
       if (exhibitIds.length === 1) {
         const detailAfter = await exhibitDetail(client, exhibitIds[0], { lock: true });
-        return { ...detailAfter, batchApproval };
+        return {
+          ...detailAfter,
+          batchApproval,
+          quotaAlertEvents: alertEventsByExhibit[0] ? alertEventsByExhibit[0].events : [],
+        };
       }
       // 跨展品：返回各展品最新详情（既有单展品字段不适用，不新增顶层展品详情字段）
       const details = [];
       for (const exId of exhibitIds) {
         details.push(await exhibitDetail(client, exId, { lock: true }));
       }
-      return { ok: true, batchApproval, exhibitDetails: details };
+      return { ok: true, batchApproval, exhibitDetails: details, quotaAlertEventsByExhibit: alertEventsByExhibit };
     });
 
     res.json(detail);
@@ -426,7 +441,18 @@ async function approve(req, res) {
     await recordAudit(client, req.sessionUser, prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
       'plan', id, { exhibitId: plan.exhibit_id, addedYearly });
 
-    return exhibitDetail(client, plan.exhibit_id, { lock: true });
+    // 批准后占用增加：同一展品锁事务内重算分级预警边沿（向上跨档才留事件）
+    const { events: alertEvents } = await alerts.recomputeAlerts(
+      client, plan.exhibit_id, {
+        actor: req.sessionUser,
+        trigger: {
+          type: prevStatus === 'submitted' ? 'plan.approve' : 'plan.reapprove',
+          detail: { planId: id, addedYearly },
+        },
+      }
+    );
+
+    return { ...(await exhibitDetail(client, plan.exhibit_id, { lock: true })), quotaAlertEvents: alertEvents };
   });
   res.json(detail);
 }
@@ -490,6 +516,12 @@ router.post('/:id/cancel', async (req, res, next) => {
         exhibitId: plan.exhibit_id,
         reason,
         previousStatus: plan.status,
+      });
+
+      // 取消后占用下降：同一展品锁事务内重算预警（回落不写事件，仅刷新最近级别/占用）
+      await alerts.recomputeAlerts(client, plan.exhibit_id, {
+        actor: req.sessionUser,
+        trigger: { type: 'plan.cancel', detail: { planId: id, previousStatus: plan.status } },
       });
     });
     res.json({ ok: true });

@@ -173,6 +173,22 @@ Node.js（Express）+ PostgreSQL，本地账号区分两类角色：
       账册新增 `sharedLightingTotal`（旧账按 0 处理，总额列原样）。既有响应字段保持兼容
       （展品详情仅附加 `residences` / `sharedLightings` / `sharedLightingDoseYearly`，
       占用来源仅附加 `kind:'sharedLighting'`）。仅保管员可登记；登录用户可查看。
+21. **年度用光额度分级预警（conservator 设置，登录可读）**：保管员按**展品 + 自然年**设置
+    **低、高两档阈值**（年度上限占比百分比，`0 < 低档 < 高档 ≤ 100`）；登录用户可查看
+    当前占用、当前级别与触发历史。
+    - **未登记年度上限的年份显示「无上限」且不触发**（级别恒为 `none`，占用仍如实显示）。
+    - **首次设置或修改阈值都以「当时占用」重建基线**，**不补发**任何历史事件。
+    - 此后**计划批准/取消/调整（含成对核准、联合核准）、年度上限变更、实测确认/纠错、
+      实测批次确认、停灯登记、计划外照明事故、展厅共享照明入账**时，均在**相应展品的锁事务内、
+      按现有统一剂量口径重算**：占用**向上跨过**低档/高档才各留一条事件（一次跨两级留两条，
+      顺序 low → high）；**回落不写事件，再次向上跨越可重新触发**；各自然年**跨年独立判定**；
+      **超上限仍显示真实占用与最高（高）级别**（占比可 >100%）。
+    - 事件在**触发操作的同一事务**内写入：多展品操作（联合核准、共享照明）回滚时事件
+      **一并回滚**，不留残影。
+    - 保管员可把历史事件**标记已读**（单条或按展品/年/级别批量，幂等）；**已读不改变预警级别**。
+    - 既有额度、审批、账册语义与字段保持兼容（展品详情仅附加 `quotaThresholds` /
+      `quotaAlerts` / `quotaAlertsUnread`，列表仅附加级别计数，触发操作响应仅附加
+      `quotaAlertEvents`）。审计记录 `quota_threshold.create` / `quota_threshold.update`。
 
 ## 一键启动（Docker Compose）
 
@@ -297,6 +313,13 @@ npm run test:utils
     单独计量；与未作废实测、停灯或照明事故相交则整次拒绝并列冲突。多展品计量与超限处理原子生效，
     超限仍入账并按展品返回超额年份、把相关未开始已批准计划转待复核。登录用户可在展品详情、
     `GET /api/residences`、`GET /api/shared-lightings`、`GET /api/halls` 只读查看。
+16. **分级预警**：保管员在展品详情「分级预警阈值」处按**展品 + 自然年**填写低档、高档
+    （年度上限占比 %，`0 < 低 < 高 ≤ 100`）后保存：系统以**当时占用重建基线、不补发事件**。
+    此后计划批准/取消/调整、上限变更、实测确认/纠错、停灯、事故、共享照明入账都会在展品锁事务内
+    重算：占用**向上跨过**每档才各留一条事件，回落不写、再次向上跨越可重新触发；跨年独立；
+    超上限仍显示真实占用与最高级别。登录用户可在顶部「用光预警」标签（可按展品/年份/级别/未读筛选）
+    与展品详情查看当前占用、级别与触发历史；保管员可单条或批量「标记已读」（不改变级别）。
+    未登记年度上限的年份显示「无上限」且不触发。
 
 ## HTTP API（含计划调整申请、成对核准、**联合核准**、年度上限下调预演、停灯登记、**计划外照明事故**、**展厅驻留与共享照明**、**实测纠错**、**年度账册封存**、**实测 CSV 批次导入**）
 
@@ -321,10 +344,15 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | --- | --- | --- |
 | `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
-| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源（含 `kind:'incident'` 事故条目与 `kind:'sharedLighting'` 共享照明归属条目）、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`incidents` 计划外照明事故（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`）与 `incidentDoseYearly` 各年事故实际用光汇总、`residences` 展厅驻留（附 `covered`）、`sharedLightings` 共享照明归属（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`/`allocations`）与 `sharedLightingDoseYearly` 各年共享照明用光汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`） |
+| `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源（含 `kind:'incident'` 事故条目与 `kind:'sharedLighting'` 共享照明归属条目）、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`incidents` 计划外照明事故（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`）与 `incidentDoseYearly` 各年事故实际用光汇总、`residences` 展厅驻留（附 `covered`）、`sharedLightings` 共享照明归属（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`/`allocations`）与 `sharedLightingDoseYearly` 各年共享照明用光汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`）、`quotaThresholds` 分级预警阈值（附当前占用/占比/级别）、`quotaAlerts` 预警触发历史与 `quotaAlertsUnread` 未读条数 |
 | `GET  /api/exhibits/:id/ledgers` | 登录 | 已封存年度账册列表；`?compare=1` 附按当前数据重算的对照差额 |
 | `POST /api/exhibits/:id/ledgers` | 保管员 | **封存某已结束自然年的用光账册**（原子快照）；未登记上限/年份未结束 400，重复封存 409 不覆盖旧账 |
 | `GET  /api/exhibits/:id/ledgers/:year` | 登录 | 某年封存账册 + 按当前数据重算值 + 上限/合计差额 + 按来源编号逐项差额（已消失来源仍列出，零差额标示） |
+| `POST /api/exhibits/:id/quota-thresholds` | 保管员 | **设置/修改分级预警阈值**（`year`/`lowPct`/`highPct`，0 < 低 < 高 ≤ 100）；以当时占用重建基线、不补发事件；成功响应为展品详情（另附 `threshold`/`rebased`/`quotaAlertEvents`） |
+| `GET  /api/quota-alerts?exhibitId=&year=&level=&unreadOnly=1&limit=&offset=` | 登录 | **预警触发事件历史**（可追溯；倒序），另返回 `unreadCount` |
+| `GET  /api/quota-alerts/unread-count?exhibitId=` | 登录 | 未读事件条数（页面角标） |
+| `POST /api/quota-alerts/:id/read` | 保管员 | 单条标记已读（幂等；**不改变预警级别**） |
+| `POST /api/quota-alerts/read-all` | 保管员 | 批量标记已读（body 可带 `exhibitId`/`year`/`level` 过滤；返回 `updatedCount`） |
 | `POST /api/exhibits/:id/limits` | 保管员 | 登记/修改某自然年上限；**若为下调，同事务即时重算并把超额年未开始计划转待复核**（成功响应仍为展品详情，另附 `overflows`/`flaggedPlans`） |
 | `POST /api/exhibits/:id/limits/preview` | 保管员 | **下调预演**：不改状态，返回凭证与该年实测/各计划估算残余/预计超额/将转复核的计划 |
 | `POST /api/exhibits/:id/limits/lower` | 保管员 | **携预演凭证提交下调**；占用已变化返回 409 + 最新结果与新凭证 |
@@ -1315,6 +1343,108 @@ curl -b cookies.txt http://localhost:3000/api/exhibits/3/ledgers/2024
 封存与同展品的批准、确认、纠错、调整等经同一展品键锁 + 行锁串行，账册不会混入变动前后两截数据。
 审计写入一条 `ledger.seal`（target 为账册编号，detail 含年份、上限、各合计与来源条数）。
 
+### 年度用光分级预警 `/api/exhibits/:id/quota-thresholds`、`/api/quota-alerts`（保管员设置，登录可读）
+
+保管员按**展品 + 自然年**设置低、高两档阈值（年度上限占比百分比，`0 < 低档 < 高档 ≤ 100`）。
+首次设置或修改都以**当时占用重建基线**、**不补发事件**；此后各类占用/上限变动在对应展品锁事务内
+按统一剂量口径重算，只有占用**向上跨过**某档才各留一条事件，回落不写、再次向上跨越可重触发；
+跨年各自然年独立；超上限仍显示真实占用与最高级别；多展品操作回滚时事件一并回滚。
+登录用户可在页面「用光预警」标签与展品详情查看；保管员可标记已读（不改变级别）。
+
+```bash
+# 1) 保管员设置（或修改）某展品某年的低/高档阈值（重建基线，不补发事件）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/exhibits/3/quota-thresholds \
+  -H 'Content-Type: application/json' \
+  -d '{"year":2026,"lowPct":60,"highPct":90}'
+
+# 2) 登录用户查询展品详情：quotaThresholds（当前占用/占比/级别）+ quotaAlerts（触发历史）
+curl -b cookies.txt http://localhost:3000/api/exhibits/3
+
+# 3) 全局/按条件查询预警事件历史（登录可读；可按展品/年份/级别/仅未读过滤）
+curl -b cookies.txt 'http://localhost:3000/api/quota-alerts?exhibitId=3&unreadOnly=1'
+curl -b cookies.txt 'http://localhost:3000/api/quota-alerts?year=2026&level=high'
+curl -b cookies.txt http://localhost:3000/api/quota-alerts/unread-count
+
+# 4) 保管员标记已读（不改变预警级别；幂等）
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/quota-alerts/12/read
+curl -b cookies-custodian.txt -X POST http://localhost:3000/api/quota-alerts/read-all \
+  -H 'Content-Type: application/json' -d '{"exhibitId":3}'
+```
+
+非法阈值（非数字、`低档 ≤ 0`、`高档 > 100`、`低档 ≥ 高档`、年份越界）→ 400；
+布展员设置/标记已读 → 403。
+
+设置成功响应（展品详情字段位于顶层，另附 `threshold` 与 `rebased`）：
+
+```json
+{
+  "exhibit": { }, "years": { }, "sources": [ ], "plans": [ ],
+  "quotaThresholds": [
+    {
+      "id": 1, "exhibitId": 3, "year": 2026,
+      "lowPct": 60, "highPct": 90,
+      "hasLimit": true, "limit": 1000,
+      "used": 0, "usedPct": 0, "level": "none",
+      "baselineUsed": 0, "baselineLevel": "none"
+    }
+  ],
+  "quotaAlerts": [],
+  "quotaAlertsUnread": 0,
+  "threshold": { "year": 2026, "lowPct": 60, "highPct": 90, "level": "none" },
+  "rebased": { "used": 0, "level": "none", "hasLimit": true }
+}
+```
+
+未登记年度上限时阈值对象为
+`{ "hasLimit": false, "limit": null, "used": 600, "usedPct": null, "level": "none" }`
+（页面显示「无上限」，占用仍如实显示，不触发）。
+
+占用向上跨档时，触发操作的成功响应（或**超额仍生效**场景的 409 响应）会附本次新事件
+`quotaAlertEvents`（跨两级时 low/high 各一条）；事件对象与历史接口一致：
+
+```json
+{
+  "id": 7,
+  "exhibitId": 3,
+  "year": 2026,
+  "thresholdId": 1,
+  "level": "high",
+  "triggerType": "plan.approve",
+  "limit": 1000,
+  "used": 950,
+  "lowPct": 60,
+  "highPct": 90,
+  "usedPct": 95,
+  "previousUsed": 600,
+  "previousLevel": "low",
+  "triggerDetail": { "planId": 12, "addedYearly": { "2026": 350 } },
+  "createdBy": 1,
+  "createdAt": "2026-02-10T03:14:22.000Z",
+  "readBy": null,
+  "readAt": null
+}
+```
+
+`triggerType` 取值：`plan.approve` / `plan.reapprove` / `plan.cancel` /
+`plan.adjustment.approve` / `plan.adjustment.pair_approve` / `plan.batch_approve` /
+`measurement.confirm` / `measurement.correct` / `measurement_batch.confirm` /
+`blackout.create` / `incident.create` / `shared_lighting.create` / `limit.change`。
+超限场景占比可超过 100（如 112.5%），级别仍为 `high`，`used` 为真实占用。
+
+历史事件列表响应：
+
+```json
+{
+  "events": [
+    { "id": 7, "exhibitId": 3, "year": 2026, "level": "high", "triggerType": "plan.approve",
+      "used": 950, "usedPct": 95, "readAt": null }
+  ],
+  "unreadCount": 1
+}
+```
+
+审计写入 `quota_threshold.create`（首次设置）与 `quota_threshold.update`（修改重建基线）。
+
 
 ```
 src/
@@ -1327,14 +1457,15 @@ src/
   auth.js          会话与角色中间件、bcrypt 登录校验
   audit.js         操作流水写入
   limit-preview.js 下调上限预演凭证（签发/一次性消耗/占用指纹）
+  alerts.js        年度用光分级预警：阈值校验/基线重建、占用向上跨档边沿判定与事件写入、查询与已读标记
   validation.js    中文输入校验（时段/日期/正数等）
   csv.js           实测 CSV 批次解析（表头识别、墙上日期时间、逐行取值校验）
   dosing.js        剂量核心算法：时间窗、按年拆分、区间扣除、重叠/包含判断
   ledger.js        年度用光账册封存：按年快照构建（复用统一占用口径）、封存校验落账、封存值与当前重算的逐项/合计差额对照
   service.js       额度占用计算、批准校验、实测窗口校验、实测纠错（旧记录作废+替代记录确认+关联）、待复核筛选、调整申请试算/核对（含成对核准）、联合核准整组试算/核对、下调上限预演核算、停灯登记校验与按年扣减、计划外照明事故登记校验/窗内替代窗外单独计量口径、展厅驻留登记/覆盖校验、共享照明按驻留交集归属/跨年拆分/多展品原子登记与冲突收集/超限处理、实测批次逐行评估（窗口/相交/行间相交）与确认超限处理
-  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（实测 CSV 批次导入：预览/导入/确认）/blackouts/incidents（计划外照明事故）/residences（展厅与驻留登记/改删）/shared-lightings（共享照明登记与只读查询）/ledgers（年度账册封存与对照）/audit 路由
+  routes/          auth/users/exhibits/plans（含联合核准 batch 接口）/adjustments/measurements（含实测纠错 correct 接口）/measurement-batches（实测 CSV 批次导入：预览/导入/确认）/blackouts/incidents（计划外照明事故）/residences（展厅与驻留登记/改删）/shared-lightings（共享照明登记与只读查询）/ledgers（年度账册封存与对照）/alerts（分级预警阈值设置、事件历史查询与已读标记）/audit 路由
 public/            原生 HTML/CSS/JS 单页界面
 scripts/test-utils.js  核心算法离线测试
-scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发）
+scripts/test-integration.js  基于 pg-mem 的端到端业务流程测试（含年度账册封存/对照/并发、分级预警基线/边沿触发/回落重触发/无上限/跨年/回滚/已读）
 Dockerfile / docker-compose.yml
 ```

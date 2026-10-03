@@ -23,6 +23,7 @@ const {
 } = require('../service');
 const { doseByYear, yearMapToObject, tsToWallString } = require('../dosing');
 const { exhibitDetail, serializeMeasurement } = require('./exhibits');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -227,8 +228,16 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         });
       }
 
+      // 实测确认后占用变化（待复核转态也可能影响估算残余）：锁事务内重算分级预警边沿
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, plan.exhibit_id, {
+          actor: req.sessionUser,
+          trigger: { type: 'measurement.confirm', detail: { measurementId: id, planId: plan.id } },
+        }
+      );
+
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
-      return { detail, overflows, overflowYears, flagged };
+      return { detail, overflows, overflowYears, flagged, alertEvents };
     });
 
     if (result.overflows.length > 0) {
@@ -243,6 +252,7 @@ router.post('/:id/confirm', requireRole('conservator'), async (req, res, next) =
         overflows: result.overflows,
         flaggedPlans: result.flagged,
         detail: result.detail,
+        quotaAlertEvents: result.alertEvents,
       });
     }
     res.json(result.detail);
@@ -334,6 +344,17 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
         });
       }
 
+      // 纠错后占用可能升降：锁事务内重算分级预警边沿（仅向上跨档留事件，下降不补发/不删除）
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, plan.exhibit_id, {
+          actor: req.sessionUser,
+          trigger: {
+            type: 'measurement.correct',
+            detail: { originalMeasurementId: id, replacementMeasurementId: replacement.id, planId: plan.id },
+          },
+        }
+      );
+
       const detail = await exhibitDetail(client, plan.exhibit_id, { lock: true });
       const correction = {
         originalMeasurementId: id,
@@ -354,7 +375,7 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
           yearly: newYearly,
         },
       };
-      return { detail, overflows, flagged, correction };
+      return { detail, overflows, flagged, correction, alertEvents };
     });
 
     if (result.overflows.length > 0) {
@@ -371,9 +392,10 @@ router.post('/:id/correct', requireRole('conservator'), async (req, res, next) =
         flaggedPlans: result.flagged,
         correction: result.correction,
         detail: result.detail,
+        quotaAlertEvents: result.alertEvents,
       });
     }
-    res.json({ ...result.detail, correction: result.correction });
+    res.json({ ...result.detail, correction: result.correction, quotaAlertEvents: result.alertEvents });
   } catch (err) {
     next(err);
   }

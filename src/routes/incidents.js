@@ -26,6 +26,7 @@ const {
   computeOccupancy,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -197,6 +198,17 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         }
       }
 
+      // 事故入账后占用变化（含转待复核对估算残余的影响）：锁事务内重算分级预警边沿
+      const { events: alertEvents } = await alerts.recomputeAlerts(
+        client, input.exhibitId, {
+          actor: req.sessionUser,
+          trigger: {
+            type: 'incident.create',
+            detail: { incidentId, yearly },
+          },
+        }
+      );
+
       const { exhibitDetail } = require('./exhibits');
       const detailAfter = await exhibitDetail(client, input.exhibitId, { lock: true });
       const freshView = await loadIncidentView(client, input.exhibitId);
@@ -205,6 +217,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         detail: detailAfter,
         overflows,
         flagged,
+        alertEvents,
         incident: incidentItem ? serializeIncident(incidentItem) : { id: incidentId, ...yearly },
       };
     });
@@ -222,10 +235,11 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         flaggedPlans: out.flagged,
         incident: out.incident,
         detail: out.detail,
+        quotaAlertEvents: out.alertEvents,
       });
     }
 
-    res.status(201).json({ ...out.detail, incident: out.incident });
+    res.status(201).json({ ...out.detail, incident: out.incident, quotaAlertEvents: out.alertEvents });
   } catch (err) {
     next(err);
   }

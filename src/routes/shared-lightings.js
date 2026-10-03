@@ -34,6 +34,7 @@ const {
   computeOccupancy,
 } = require('../service');
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
+const alerts = require('../alerts');
 
 const router = express.Router();
 
@@ -201,6 +202,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         // 逐展品重算占用并收集超额（本次归属剂量影响到的年份为限）；超限仍入账。
         const overflowsByExhibit = [];
         const flaggedPlansByExhibit = [];
+        const alertEventsByExhibit = [];
         const exhibitDetails = [];
         for (const exId of exhibitIds) {
           const occupancy = await computeOccupancy(client, exId);
@@ -249,6 +251,17 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
               });
             }
           }
+
+          // 共享照明归属入账（含可能的待复核转态）后：同一多展品事务内逐展品重算分级预警边沿。
+          // 整次登记回滚时，归属/计划状态与预警事件一并回滚。
+          const { events: alertEvents } = await alerts.recomputeAlerts(client, exId, {
+            actor: req.sessionUser,
+            trigger: {
+              type: 'shared_lighting.create',
+              detail: { sharedLightingId: sessionId, hallCode: input.hallCode },
+            },
+          });
+          alertEventsByExhibit.push({ exhibitId: exId, events: alertEvents });
         }
 
         // 刷新各展品详情（含被转待复核后的状态）
@@ -283,6 +296,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
           sharedLighting,
           overflowsByExhibit,
           flaggedPlansByExhibit,
+          alertEventsByExhibit,
         };
       }
     );
@@ -290,6 +304,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
     const allOverflows = out.overflowsByExhibit.flatMap((o) =>
       o.overflows.map((x) => ({ exhibitId: o.exhibitId, ...x }))
     );
+    const allAlertEvents = out.alertEventsByExhibit.flatMap((a) => a.events);
 
     if (allOverflows.length > 0) {
       // 共享照明已入账但造成超限：409 报告各展品超额年份与被转待复核的计划（仍已生效）。
@@ -311,6 +326,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         flaggedPlans: out.flaggedPlansByExhibit,
         sharedLighting: out.sharedLighting,
         exhibitDetails: out.exhibitDetails,
+        quotaAlertEvents: allAlertEvents,
       });
     }
 
@@ -319,6 +335,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       return res.status(201).json({
         ...out.exhibitDetails[0],
         sharedLighting: out.sharedLighting[0],
+        quotaAlertEvents: allAlertEvents,
       });
     }
     res.status(201).json({
@@ -327,6 +344,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       sharedLighting: out.sharedLighting,
       exhibitIds: out.exhibitIds,
       exhibitDetails: out.exhibitDetails,
+      quotaAlertEventsByExhibit: out.alertEventsByExhibit,
     });
   } catch (err) {
     next(err);

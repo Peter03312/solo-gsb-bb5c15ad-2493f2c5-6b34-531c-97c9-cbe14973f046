@@ -267,6 +267,62 @@ CREATE TABLE IF NOT EXISTS annual_ledgers (
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_exhibit ON annual_ledgers (exhibit_id, year);
 
+-- 展品年度用光额度的分级预警阈值（保管员按展品 + 自然年设置低、高两档，年度上限占比百分比）。
+-- 0 < low_pct < high_pct <= 100；未登记年度上限的年份也可设置阈值，但在登记上限前不触发事件。
+-- 首次设置/修改阈值时以“当时占用”重建基线（baseline_used_lxh/baseline_level）：
+--   * 不补发任何历史事件；
+--   * 此后占用向上跨过每档（none→low、low→high；超限仍记 high 档）才各留一条事件，
+--     回落后再次向上跨越可重新触发；跨年各自然年独立判定。
+-- last_used_lxh/last_level 是最近一次在展品锁事务内重算后的占用与级别（边沿判定用，随占用更新）；
+-- 超上限不单独设档：占用比例超过 100% 时仍显示真实占用与“高级”预警。
+CREATE TABLE IF NOT EXISTS annual_quota_thresholds (
+    id                  BIGSERIAL PRIMARY KEY,
+    exhibit_id          BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year                INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    low_pct             NUMERIC(7,3) NOT NULL CHECK (low_pct > 0 AND low_pct < 100),
+    high_pct            NUMERIC(7,3) NOT NULL CHECK (high_pct > 0 AND high_pct <= 100),
+    baseline_used_lxh   NUMERIC(12,3) NOT NULL DEFAULT 0,
+    baseline_level      TEXT NOT NULL DEFAULT 'none' CHECK (baseline_level IN ('none','low','high')),
+    last_used_lxh       NUMERIC(12,3) NOT NULL DEFAULT 0,
+    last_level          TEXT NOT NULL DEFAULT 'none' CHECK (last_level IN ('none','low','high')),
+    created_by          BIGINT REFERENCES users(id),
+    updated_by          BIGINT REFERENCES users(id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exhibit_id, year),
+    CHECK (low_pct < high_pct)
+);
+CREATE INDEX IF NOT EXISTS idx_quota_threshold_exhibit ON annual_quota_thresholds (exhibit_id, year);
+
+-- 分级预警触发事件（可追溯）。每次“占用向上跨过某档”写一条；回落不写、再次跨越可重触发。
+-- 事件只增不改（标记已读只改 read 标记列，不改级别/占用快照）；多展品事务回滚时随事务一并回滚。
+CREATE TABLE IF NOT EXISTS annual_quota_alerts (
+    id                BIGSERIAL PRIMARY KEY,
+    exhibit_id        BIGINT NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    year              INTEGER NOT NULL CHECK (year BETWEEN 1900 AND 2999),
+    threshold_id      BIGINT NOT NULL REFERENCES annual_quota_thresholds(id) ON DELETE CASCADE,
+    level             TEXT NOT NULL CHECK (level IN ('low','high')),
+    trigger_type      TEXT NOT NULL,
+    limit_lxh         NUMERIC(12,3),
+    used_lxh          NUMERIC(12,3) NOT NULL,
+    low_pct           NUMERIC(7,3) NOT NULL,
+    high_pct          NUMERIC(7,3) NOT NULL,
+    used_pct          NUMERIC(9,3) NOT NULL,
+    previous_used_lxh NUMERIC(12,3) NOT NULL,
+    previous_level    TEXT NOT NULL CHECK (previous_level IN ('none','low','high')),
+    trigger_detail    JSONB,
+    created_by        BIGINT REFERENCES users(id),
+    read_by           BIGINT REFERENCES users(id),
+    read_at           TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_quota_alert_exhibit_year ON annual_quota_alerts (exhibit_id, year, id DESC);
+CREATE INDEX IF NOT EXISTS idx_quota_alert_unread ON annual_quota_alerts (exhibit_id) WHERE read_at IS NULL;
+
+-- 既有库升级：补齐已读标记列（首次建库时上述 CREATE TABLE 已包含，IF NOT EXISTS 为空操作）。
+ALTER TABLE annual_quota_alerts ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;
+ALTER TABLE annual_quota_alerts ADD COLUMN IF NOT EXISTS read_by BIGINT REFERENCES users(id);
+
 -- 操作流水（审批、确认、状态变更等全部保留）
 CREATE TABLE IF NOT EXISTS audit_events (
     id              BIGSERIAL PRIMARY KEY,

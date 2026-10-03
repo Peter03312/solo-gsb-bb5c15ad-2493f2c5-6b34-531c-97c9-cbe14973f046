@@ -149,3 +149,24 @@ table.diff-table td.changed { background: #fff5e0; color: #9a6700; }
 .tag.down { background: #e8f7ef; color: #176b3a; }
 .tag.gone { background: #f3e8ff; color: #6b21a8; }
 .tag.new { background: #e0ecff; color: #1d4f91; }
+
+/* 分级预警 */
+.nav-unread {
+  display: inline-block; min-width: 18px; margin-left: 4px; padding: 0 5px;
+  background: #d92d20; color: #fff; border-radius: 999px; font-size: 11px;
+  line-height: 16px; text-align: center; vertical-align: middle;
+}
+.alert-level { font-weight: 600; white-space: nowrap; }
+.alert-level.none { color: #176b3a; font-weight: 400; }
+.alert-level.low { color: #9a6700; }
+.alert-level.high { color: #b42318; }
+.alert-tag {
+  display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap;
+}
+.alert-tag.low { background: #fff1da; color: #9a6700; }
+.alert-tag.high { background: #fdeceb; color: #b42318; }
+tr.row-low td { background: #fffaf0; }
+tr.row-high td { background: #fef3f2; }
+.read-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+.read-dot.unread { background: #d92d20; }
+.read-dot.read { background: #cbd2d9; }
